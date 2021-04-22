@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
-package com.nvidia.spark.rapids.shims.spark311
+package com.nvidia.spark.rapids.shims.spark311cloud
 
 import java.net.URI
 import java.nio.ByteBuffer
 
 import com.nvidia.spark.rapids._
 import com.nvidia.spark.rapids.shims.spark301.Spark301Shims
-import com.nvidia.spark.rapids.spark311.RapidsShuffleManager
+import com.nvidia.spark.rapids.spark311cloud.RapidsShuffleManager
 import org.apache.arrow.memory.ReferenceManager
 import org.apache.arrow.vector.ValueVector
 
@@ -44,12 +44,12 @@ import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNes
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.sql.rapids.{GpuFileSourceScanExec, GpuStringReplace, ShuffleManagerShimBase}
 import org.apache.spark.sql.rapids.execution.{GpuBroadcastNestedLoopJoinExecBase, GpuShuffleExchangeExecBase}
-import org.apache.spark.sql.rapids.shims.spark311._
+import org.apache.spark.sql.rapids.shims.spark311cloud.{GpuColumnarToRowTransitionExec, GpuInMemoryTableScanExec, GpuSchemaUtils, HadoopFSUtilsShim, ShuffleManagerShim}
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.{BlockId, BlockManagerId}
 
-class Spark311Shims extends Spark301Shims {
+class Spark311CloudShims extends Spark301Shims {
 
   override def getSparkShimVersion: ShimVersion = SparkShimServiceProvider.VERSION
 
@@ -388,7 +388,7 @@ class Spark311Shims extends Spark301Shims {
     val serName = plan.conf.getConf(StaticSQLConf.SPARK_CACHE_SERIALIZER)
     val serClass = Class.forName(serName)
     if (serClass == classOf[ParquetCachedBatchSerializer]) {
-      org.apache.spark.sql.rapids.shims.spark311.GpuColumnarToRowTransitionExec(plan)
+      GpuColumnarToRowTransitionExec(plan)
     } else {
       GpuColumnarToRowExec(plan)
     }

@@ -47,6 +47,12 @@
             </properties>
         </profile>
         <profile>
+            <id>spark311cloud</id>
+            <properties>
+                <spark.version>${spark311cloud.version}</spark.version>
+            </properties>
+        </profile>
+        <profile>
             <id>spark320</id>
             <properties>
                 <spark.version>${spark320.version}</spark.version>
