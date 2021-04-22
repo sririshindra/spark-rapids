@@ -856,7 +856,8 @@ class ParquetCachedBatchSerializer extends CachedBatchSerializer with Arm {
               columnReaders(i) =
                 new VectorizedColumnReader(columns.get(i), types.get(i)
                   .getOriginalType, pages.getPageReader(columns.get(i)), null /*convertTz*/,
-                  LegacyBehaviorPolicy.CORRECTED.toString, LegacyBehaviorPolicy.EXCEPTION.toString)
+                  LegacyBehaviorPolicy.CORRECTED.toString, LegacyBehaviorPolicy.EXCEPTION.toString,
+                  false)
             }
           }
           totalCountLoadedSoFar += pages.getRowCount
