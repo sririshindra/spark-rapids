@@ -39,7 +39,7 @@
             </modules>
         </profile>
         <profile>
-            <id>clouderaspark311</id>
+            <id>cloudera311</id>
             <modules>
                 <module>spark311cloud</module>
             </modules>
@@ -69,7 +69,6 @@
         <module>spark301</module>
         <module>spark302</module>
         <module>spark311</module>
-<!--        <module>spark311cloud</module>-->
         <module>aggregator</module>
     </modules>
     <dependencies>
