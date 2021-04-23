@@ -250,7 +250,7 @@
         <spark302.version>3.0.2</spark302.version>
         <spark303.version>3.0.3-SNAPSHOT</spark303.version>
         <spark311.version>3.1.1</spark311.version>
-        <spark311cloud.version>3.1.1.3.1.7270.1-1</spark311cloud.version>
+        <spark311cloud.version>3.1.1.3.1.7270.0-253</spark311cloud.version>
         <spark312.version>3.1.2-SNAPSHOT</spark312.version>
         <spark320.version>3.2.0-SNAPSHOT</spark320.version>
         <mockito.version>3.6.0</mockito.version>
