@@ -19,9 +19,9 @@ package com.nvidia.spark.rapids.shims.spark320cdh
 import com.nvidia.spark.rapids.{ClouderaShimVersion, SparkShims}
 
 object SparkShimServiceProvider {
-  val VERSION = ClouderaShimVersion(3, 2, 0, "3.2.7290.0")
-  // cdh version can have numbers after after 7270
-  val CDH_BASE_VERSION = "3.2.0.3.2.7290.0"
+  val VERSION = ClouderaShimVersion(3, 2, 0, "3.2.7170")
+  // cdh version can have numbers after after 7170
+  val CDH_BASE_VERSION = "3.2.0.3.2.7170"
 }
 
 class SparkShimServiceProvider extends com.nvidia.spark.rapids.SparkShimServiceProvider {

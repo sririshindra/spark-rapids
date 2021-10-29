@@ -26,7 +26,7 @@ import org.apache.spark.sql.rapids.{ProxyRapidsShuffleInternalManagerBase, Rapid
  *       `ShuffleManager` and `SortShuffleManager` classes.
  */
 class RapidsShuffleInternalManager(conf: SparkConf, isDriver: Boolean)
-    extends RapidsShuffleInternalManagerBase(conf, isDriver) {
+  extends RapidsShuffleInternalManagerBase(conf, isDriver) {
 
   def getReader[K, C](
       handle: ShuffleHandle,
@@ -41,8 +41,9 @@ class RapidsShuffleInternalManager(conf: SparkConf, isDriver: Boolean)
   }
 }
 
+
 class ProxyRapidsShuffleInternalManager(conf: SparkConf, isDriver: Boolean)
-    extends ProxyRapidsShuffleInternalManagerBase(conf, isDriver) {
+  extends ProxyRapidsShuffleInternalManagerBase(conf, isDriver) with ShuffleManager {
 
   def getReader[K, C](
       handle: ShuffleHandle,
@@ -52,7 +53,7 @@ class ProxyRapidsShuffleInternalManager(conf: SparkConf, isDriver: Boolean)
       endPartition: Int,
       context: TaskContext,
       metrics: ShuffleReadMetricsReporter
-  ): ShuffleReader[K, C] = {
+      ): ShuffleReader[K, C] = {
     self.getReader(handle, startMapIndex, endMapIndex, startPartition, endPartition, context,
       metrics)
   }
