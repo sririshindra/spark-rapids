@@ -26,7 +26,7 @@ object SparkShimServiceProvider {
 class SparkShimServiceProvider extends com.nvidia.spark.rapids.SparkShimServiceProvider {
 
   def matchesVersion(version: String): Boolean = {
-    version.contains(SparkShimServiceProvider.CDH_BASE_VERSION)
+    SparkShimServiceProvider.VERSIONNAMES.contains(version)
   }
 
   def buildShim: SparkShims = {
