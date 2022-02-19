@@ -11,9 +11,9 @@ At the end of this guide, the reader will be able to run a sample Apache Spark a
 on NVIDIA GPUs on Databricks.
 
 ## Prerequisites
-    * Apache Spark 3.x running in Databricks Runtime 7.3 ML or 8.2 ML with GPU
-    * AWS: 7.3 LTS ML (GPU, Scala 2.12, Spark 3.0.1) or 8.2 ML (GPU, Scala 2.12, Spark 3.1.1)
-    * Azure: 7.3 LTS ML (GPU, Scala 2.12, Spark 3.0.1) or 8.2 ML (GPU, Scala 2.12, Spark 3.1.1)
+    * Apache Spark 3.x running in Databricks Runtime 7.3 ML or 9.1 ML with GPU
+    * AWS: 7.3 LTS ML (GPU, Scala 2.12, Spark 3.0.1) or 9.1 LTS ML (GPU, Scala 2.12, Spark 3.1.2)
+    * Azure: 7.3 LTS ML (GPU, Scala 2.12, Spark 3.0.1) or 9.1 LTS ML (GPU, Scala 2.12, Spark 3.1.2)
 
 Databricks may do [maintenance
 releases](https://docs.databricks.com/release-notes/runtime/maintenance-updates.html) for their
@@ -26,12 +26,12 @@ The number of GPUs per node dictates the number of Spark executors that can run 
 1. Adaptive query execution(AQE) and Delta optimization write do not work. These should be disabled
 when using the plugin. Queries may still see significant speedups even with AQE disabled.
 
-    ```bash 
-    spark.databricks.delta.optimizeWrite.enabled false
-    spark.sql.adaptive.enabled false
-    ```
+   ```bash 
+   spark.databricks.delta.optimizeWrite.enabled false
+   spark.sql.adaptive.enabled false
+   ```
     
-    See [issue-1059](https://github.com/NVIDIA/spark-rapids/issues/1059) for more detail. 
+   See [issue-1059](https://github.com/NVIDIA/spark-rapids/issues/1059) for more detail. 
 
 2. Dynamic partition pruning(DPP) does not work.  This results in poor performance for queries which
    would normally benefit from DPP.  See
@@ -42,10 +42,10 @@ when using the plugin. Queries may still see significant speedups even with AQE 
 
 4. Cannot spin off multiple executors on a multi-GPU node. 
 
-	Even though it is possible to set `spark.executor.resource.gpu.amount=N` (where N is the number
-    of GPUs per node) in the in Spark Configuration tab, Databricks overrides this to
-    `spark.executor.resource.gpu.amount=1`.  This will result in failed executors when starting the
-    cluster.
+   Even though it is possible to set `spark.executor.resource.gpu.amount=1` in the in Spark 
+   Configuration tab, Databricks overrides this to `spark.executor.resource.gpu.amount=N` 
+   (where N is the number of GPUs per node). This will result in failed executors when starting the
+   cluster.
 
 5. Databricks makes changes to the runtime without notification.
 
@@ -85,9 +85,9 @@ Update 2. Users wishing to try 21.06.1 or later on Databricks 7.3 LTS ML will ne
 CUDA 11.0 toolkit on the cluster.  This can be done with the [generate-init-script-cuda11.ipynb
 ](../demo/Databricks/generate-init-script-cuda11.ipynb) init script, which installs both the RAPIDS
 Spark plugin and the CUDA 11 toolkit. 
-    - [Databricks 8.2
-    ML](https://docs.databricks.com/release-notes/runtime/8.2ml.html#system-environment) has CUDA 11
-    installed.  Users will need to use 21.06.2 or later on Databricks 8.2 ML. In this case use
+    - [Databricks 9.1 LTS
+    ML](https://docs.databricks.com/release-notes/runtime/9.1ml.html#system-environment) has CUDA 11
+    installed.  Users will need to use 21.12.0 or later on Databricks 9.1 LTS ML. In this case use
     [generate-init-script.ipynb](../demo/Databricks/generate-init-script.ipynb) which will install
     the RAPIDS Spark plugin.
 2. Once you are in the notebook, click the “Run All” button.
@@ -143,7 +143,7 @@ Spark plugin and the CUDA 11 toolkit.
     ```bash
     spark.rapids.sql.python.gpu.enabled true
     spark.python.daemon.module rapids.daemon_databricks
-    spark.executorEnv.PYTHONPATH /databricks/jars/rapids-4-spark_2.12-21.10.0.jar:/databricks/spark/python
+    spark.executorEnv.PYTHONPATH /databricks/jars/rapids-4-spark_2.12-22.02.0.jar:/databricks/spark/python
     ```
 
 7. Once you’ve added the Spark config, click “Confirm and Restart”.

@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION.
+# Copyright (c) 2020-2022, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,7 +14,8 @@
 
 import pytest
 
-from asserts import assert_gpu_and_cpu_are_equal_collect, assert_gpu_and_cpu_are_equal_sql,\
+from asserts import assert_gpu_and_cpu_are_equal_collect, assert_gpu_and_cpu_row_counts_equal,\
+    assert_gpu_and_cpu_are_equal_sql,\
     assert_gpu_fallback_collect, assert_cpu_and_gpu_are_equal_sql_with_capture,\
     assert_cpu_and_gpu_are_equal_collect_with_capture, run_with_cpu, run_with_cpu_and_gpu
 from conftest import is_databricks_runtime
@@ -25,7 +26,7 @@ from marks import *
 import pyspark.sql.functions as f
 from spark_session import is_before_spark_311, with_cpu_session
 
-_approx_percentile_conf = { 'spark.rapids.sql.expression.ApproximatePercentile': 'true' }
+pytestmark = pytest.mark.nightly_resource_consuming_test
 
 _no_nans_float_conf = {'spark.rapids.sql.variableFloatAgg.enabled': 'true',
                        'spark.rapids.sql.hasNans': 'false',
@@ -254,33 +255,152 @@ _grpkey_small_decimals = [
     ('b', DecimalGen(precision=5, scale=2)),
     ('c', DecimalGen(precision=8, scale=3))]
 
+_grpkey_big_decimals = [
+    ('a', RepeatSeqGen(DecimalGen(precision=32, scale=10, nullable=(True, 10.0)), length=50)),
+    ('b', DecimalGen(precision=20, scale=2)),
+    ('c', DecimalGen(precision=36, scale=5))]
+
+_grpkey_short_mid_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_18_3),
+    ('c', decimal_gen_18_3)]
+
+_grpkey_short_big_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_20_2),
+    ('c', decimal_gen_20_2)]
+
+# NOTE on older versions of Spark decimal 38 causes the CPU to crash
+#  instead of detect overflows, we have versions of this for both
+#  36 and 38 so we can get some coverage for old versions and full
+# coverage for newer versions
+_grpkey_short_very_big_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_36_5),
+    ('c', decimal_gen_36_5)]
+
+_grpkey_short_very_big_neg_scale_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_36_neg5),
+    ('c', decimal_gen_36_neg5)]
+
+_grpkey_short_full_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_38_0),
+    ('c', decimal_gen_38_0)]
+
+_grpkey_short_full_neg_scale_decimals = [
+    ('a', RepeatSeqGen(short_gen, length=50)),
+    ('b', decimal_gen_38_neg10),
+    ('c', decimal_gen_38_neg10)]
+
+
 _init_list_no_nans_with_decimal = _init_list_no_nans + [
     _grpkey_small_decimals]
+
+_init_list_no_nans_with_decimalbig = _init_list_no_nans + [
+    _grpkey_small_decimals, _grpkey_big_decimals, _grpkey_short_mid_decimals,
+    _grpkey_short_big_decimals, _grpkey_short_very_big_decimals, 
+    _grpkey_short_very_big_neg_scale_decimals]
+
+
+_init_list_full_decimal = [_grpkey_short_full_decimals, 
+    _grpkey_short_full_neg_scale_decimals]
+
+#Any smaller precision takes way too long to process on the CPU
+# or results in using too much memory on the GPU
+@nightly_gpu_mem_consuming_case
+@pytest.mark.parametrize('precision', [38, 37, 36, 35, 34, 33, 32, 31], ids=idfn)
+def test_hash_reduction_decimal_overflow_sum(precision):
+    constant = '9' * precision
+    count = pow(10, 38 - precision)
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: spark.range(count)\
+                .selectExpr("CAST('{}' as Decimal({}, 0)) as a".format(constant, precision))\
+                .selectExpr("SUM(a)"),
+        # This is set to 128m because of a number of other bugs that compound to having us
+        # run out of memory in some setups. These should not happen in production, because
+        # we really are just doing a really bad job at multiplying to get this result so
+        # some optimizations are conspiring against us.
+        conf = {'spark.rapids.sql.batchSizeBytes': '128m'})
+
+@pytest.mark.parametrize('data_gen', [_longs_with_nulls], ids=idfn)
+def test_hash_grpby_sum_count_action(data_gen):
+    assert_gpu_and_cpu_row_counts_equal(
+        lambda spark: gen_df(spark, data_gen, length=100).groupby('a').agg(f.sum('b'))
+    )
+
+@pytest.mark.parametrize('data_gen', [_longs_with_nulls], ids=idfn)
+def test_hash_reduction_sum_count_action(data_gen):
+    assert_gpu_and_cpu_row_counts_equal(
+        lambda spark: gen_df(spark, data_gen, length=100).agg(f.sum('b'))
+    )
+
+# Make sure that we can do computation in the group by columns
+@ignore_order
+def test_computation_in_grpby_columns():
+    conf = {'spark.rapids.sql.batchSizeBytes' : '1000'}
+    data_gen = [
+            ('a', RepeatSeqGen(StringGen('a{1,20}'), length=50)),
+            ('b', short_gen)]
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: gen_df(spark, data_gen).groupby(f.substring(f.col('a'), 2, 10)).agg(f.sum('b')),
+        conf = conf)
 
 @shuffle_test
 @approximate_float
 @ignore_order
 @incompat
-@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimal, ids=idfn)
+@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimalbig, ids=idfn)
 @pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
 def test_hash_grpby_sum(data_gen, conf):
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: gen_df(spark, data_gen, length=100).groupby('a').agg(f.sum('b')),
-        conf=conf
-    )
+        conf = copy_and_update(allow_negative_scale_of_decimal_conf, conf))
 
+@pytest.mark.skipif(is_before_spark_311(), reason="SUM overflows for CPU were fixed in Spark 3.1.1")
+@shuffle_test
+@approximate_float
+@ignore_order
+@incompat
+@pytest.mark.parametrize('data_gen', _init_list_full_decimal, ids=idfn)
+@pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
+def test_hash_grpby_sum_full_decimal(data_gen, conf):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: gen_df(spark, data_gen, length=100).groupby('a').agg(f.sum('b')),
+        conf = copy_and_update(allow_negative_scale_of_decimal_conf, conf))
 
 @approximate_float
 @ignore_order
 @incompat
-@pytest.mark.parametrize('data_gen', _init_list_with_nans_and_no_nans, ids=idfn)
+@pytest.mark.parametrize('data_gen', numeric_gens + decimal_gens + [decimal_gen_20_2, decimal_gen_30_2, decimal_gen_36_5, decimal_gen_36_neg5], ids=idfn)
+@pytest.mark.parametrize('conf', get_params(_confs_with_nans, params_markers_for_confs_nans), ids=idfn)
+def test_hash_reduction_sum(data_gen, conf):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen, length=100).selectExpr("SUM(a)"),
+        conf = copy_and_update(allow_negative_scale_of_decimal_conf, conf))
+
+@pytest.mark.skipif(is_before_spark_311(), reason="SUM overflows for CPU were fixed in Spark 3.1.1")
+@approximate_float
+@ignore_order
+@incompat
+@pytest.mark.parametrize('data_gen', numeric_gens + decimal_gens + [decimal_gen_38_0, decimal_gen_38_10, decimal_gen_38_neg10], ids=idfn)
+@pytest.mark.parametrize('conf', get_params(_confs_with_nans, params_markers_for_confs_nans), ids=idfn)
+def test_hash_reduction_sum_full_decimal(data_gen, conf):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen, length=100).selectExpr("SUM(a)"),
+        conf = copy_and_update(allow_negative_scale_of_decimal_conf, conf))
+
+@approximate_float
+@ignore_order
+@incompat
+@pytest.mark.parametrize('data_gen', _init_list_with_nans_and_no_nans + [_grpkey_short_mid_decimals, _grpkey_short_big_decimals], ids=idfn)
 @pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
 def test_hash_grpby_avg(data_gen, conf):
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: gen_df(spark, data_gen, length=100).groupby('a').agg(f.avg('b')),
         conf=conf
     )
-
 
 # tracks https://github.com/NVIDIA/spark-rapids/issues/154
 @approximate_float
@@ -300,11 +420,28 @@ def test_hash_avg_nulls_partial_only(data_gen):
         conf=_no_nans_float_conf_partial
     )
 
+@approximate_float
+@ignore_order
+@incompat
+@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimalbig, ids=idfn)
+def test_intersectAll(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark : gen_df(spark, data_gen, length=100).intersectAll(gen_df(spark, data_gen, length=100)),
+        conf=allow_negative_scale_of_decimal_conf)
+
+@approximate_float
+@ignore_order
+@incompat
+@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimalbig, ids=idfn)
+def test_exceptAll(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark : gen_df(spark, data_gen, length=100).exceptAll(gen_df(spark, data_gen, length=100).filter('a != b')),
+        conf=allow_negative_scale_of_decimal_conf)
 
 @approximate_float
 @ignore_order(local=True)
 @incompat
-@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimal, ids=idfn)
+@pytest.mark.parametrize('data_gen', _init_list_no_nans_with_decimalbig, ids=idfn)
 @pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
 def test_hash_grpby_pivot(data_gen, conf):
     assert_gpu_and_cpu_are_equal_collect(
@@ -312,7 +449,7 @@ def test_hash_grpby_pivot(data_gen, conf):
             .groupby('a')
             .pivot('b')
             .agg(f.sum('c')),
-        conf=conf)
+        conf = copy_and_update(allow_negative_scale_of_decimal_conf, conf))
 
 @approximate_float
 @ignore_order(local=True)
@@ -416,8 +553,14 @@ _repeat_agg_column_for_collect_op = [
     RepeatSeqGen(FloatGen(), length=15),
     RepeatSeqGen(DoubleGen(), length=15),
     RepeatSeqGen(DecimalGen(precision=8, scale=3), length=15),
+    RepeatSeqGen(decimal_gen_12_2, length=15),
     # case to verify the NAN_UNEQUAL strategy
     RepeatSeqGen(FloatGen().with_special_case(math.nan, 200.0), length=5),
+]
+
+_full_repeat_agg_column_for_collect_op = [
+    RepeatSeqGen(decimal_gen_36_5, length=15),
+    RepeatSeqGen(decimal_gen_38_10, length=15)
 ]
 
 _gen_data_for_collect_op = [[
@@ -425,14 +568,67 @@ _gen_data_for_collect_op = [[
     ('b', value_gen),
     ('c', LongRangeGen())] for value_gen in _repeat_agg_column_for_collect_op]
 
+_full_gen_data_for_collect_op = _gen_data_for_collect_op + [[
+    ('a', RepeatSeqGen(LongGen(), length=20)),
+    ('b', value_gen),
+    ('c', LongRangeGen())] for value_gen in _full_repeat_agg_column_for_collect_op]
+
 _repeat_agg_column_for_collect_list_op = [
         RepeatSeqGen(ArrayGen(int_gen), length=15),
         RepeatSeqGen(all_basic_struct_gen, length=15),
         RepeatSeqGen(simple_string_to_string_map_gen, length=15)]
 
-_gen_data_for_collect_list_op = _gen_data_for_collect_op + [[
+_gen_data_for_collect_list_op = _full_gen_data_for_collect_op + [[
     ('a', RepeatSeqGen(LongGen(), length=20)),
     ('b', value_gen)] for value_gen in _repeat_agg_column_for_collect_list_op]
+
+_repeat_agg_column_for_collect_set_op = [
+    RepeatSeqGen(all_basic_struct_gen, length=15),
+    RepeatSeqGen(StructGen([['child0', all_basic_struct_gen]]), length=15)]
+
+_gen_data_for_collect_set_op_for_unique_group_by_key = [[
+    ('a', LongRangeGen()),
+    ('b', value_gen)] for value_gen in _repeat_agg_column_for_collect_set_op]
+
+_gen_data_for_collect_set_op = [[
+    ('a', RepeatSeqGen(LongGen(), length=20)),
+    ('b', value_gen)] for value_gen in _repeat_agg_column_for_collect_set_op]
+
+# very simple test for just a count on decimals 128 values until we can support more with them
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen', decimal_128_gens, ids=idfn)
+def test_decimal128_count_reduction(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen).selectExpr('count(a)'),
+            conf = allow_negative_scale_of_decimal_conf)
+
+# very simple test for just a count on decimals 128 values until we can support more with them
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen', decimal_128_gens, ids=idfn)
+def test_decimal128_count_group_by(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: two_col_df(spark, byte_gen, data_gen)
+            .groupby('a')
+            .agg(f.count('b')),
+            conf = allow_negative_scale_of_decimal_conf)
+
+# very simple test for just a min/max on decimals 128 values until we can support more with them
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen', decimal_128_gens, ids=idfn)
+def test_decimal128_min_max_reduction(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: unary_op_df(spark, data_gen).selectExpr('min(a)', 'max(a)'),
+            conf = allow_negative_scale_of_decimal_conf)
+
+# very simple test for just a min/max on decimals 128 values until we can support more with them
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen', decimal_128_gens, ids=idfn)
+def test_decimal128_min_max_group_by(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: two_col_df(spark, byte_gen, data_gen)
+            .groupby('a')
+            .agg(f.min('b'), f.max('b')),
+            conf = allow_negative_scale_of_decimal_conf)
 
 # to avoid ordering issues with collect_list we do it all in a single task
 @ignore_order(local=True)
@@ -449,7 +645,7 @@ def test_hash_groupby_collect_list(data_gen, use_obj_hash_agg):
 @approximate_float
 @ignore_order(local=True)
 @incompat
-@pytest.mark.parametrize('data_gen', _gen_data_for_collect_op, ids=idfn)
+@pytest.mark.parametrize('data_gen', _full_gen_data_for_collect_op, ids=idfn)
 def test_hash_groupby_collect_set(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
         lambda spark: gen_df(spark, data_gen, length=100)
@@ -459,7 +655,31 @@ def test_hash_groupby_collect_set(data_gen):
 @approximate_float
 @ignore_order(local=True)
 @incompat
-@pytest.mark.parametrize('data_gen', _gen_data_for_collect_op, ids=idfn)
+@pytest.mark.parametrize('data_gen', _gen_data_for_collect_set_op, ids=idfn)
+@pytest.mark.xfail(reason="the result order from collect-set can not be ensured for CPU and GPU."
+                          " We need to enable this after SortArray has supported on nested types."
+                          " See https://github.com/NVIDIA/spark-rapids/issues/3715")
+def test_hash_groupby_collect_set_on_nested_type(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: gen_df(spark, data_gen, length=100)
+            .groupby('a')
+            .agg(f.sort_array(f.collect_set('b')), f.count('b')))
+
+# After https://github.com/NVIDIA/spark-rapids/issues/3715 is fixed, we should remove this test case
+@approximate_float
+@ignore_order(local=True)
+@incompat
+@pytest.mark.parametrize('data_gen', _gen_data_for_collect_set_op_for_unique_group_by_key, ids=idfn)
+def test_hash_groupby_collect_set_on_nested_type_for_unique_group_by(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        lambda spark: gen_df(spark, data_gen, length=100)
+            .groupby('a')
+            .agg(f.collect_set('b')))
+
+@approximate_float
+@ignore_order(local=True)
+@incompat
+@pytest.mark.parametrize('data_gen', _full_gen_data_for_collect_op, ids=idfn)
 def test_hash_groupby_collect_with_single_distinct(data_gen):
     # test collect_ops with other distinct aggregations
     assert_gpu_and_cpu_are_equal_collect(
@@ -521,7 +741,7 @@ _replace_modes_non_distinct = [
                'SortArray', 'Alias', 'Literal', 'Count', 'CollectList', 'CollectSet',
                'GpuToCpuCollectBufferTransition', 'CpuToGpuCollectBufferTransition',
                'AggregateExpression')
-@pytest.mark.parametrize('data_gen', _gen_data_for_collect_op, ids=idfn)
+@pytest.mark.parametrize('data_gen', _full_gen_data_for_collect_op, ids=idfn)
 @pytest.mark.parametrize('replace_mode', _replace_modes_non_distinct, ids=idfn)
 @pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
 @pytest.mark.parametrize('use_obj_hash_agg', ['false', 'true'], ids=idfn)
@@ -562,21 +782,23 @@ _replace_modes_single_distinct = [
     # Databricks runtime: GPU(Final&Complete) -> CPU(PartialMerge)
     'final|partialMerge&partial|final&complete',
 ]
-# TODO: add param of use_obj_hash_agg after https://github.com/NVIDIA/spark-rapids/issues/3367 getting fixed
 @ignore_order(local=True)
 @allow_non_gpu('ObjectHashAggregateExec', 'SortAggregateExec',
                'ShuffleExchangeExec', 'HashPartitioning', 'SortExec',
                'SortArray', 'Alias', 'Literal', 'Count', 'CollectList', 'CollectSet',
                'GpuToCpuCollectBufferTransition', 'CpuToGpuCollectBufferTransition',
                'AggregateExpression')
-@pytest.mark.parametrize('data_gen', _gen_data_for_collect_op, ids=idfn)
+@pytest.mark.parametrize('data_gen', _full_gen_data_for_collect_op, ids=idfn)
 @pytest.mark.parametrize('replace_mode', _replace_modes_single_distinct, ids=idfn)
 @pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+@pytest.mark.parametrize('use_obj_hash_agg', ['false', 'true'], ids=idfn)
 def test_hash_groupby_collect_partial_replace_with_distinct_fallback(data_gen,
                                                                      replace_mode,
-                                                                     aqe_enabled):
+                                                                     aqe_enabled,
+                                                                     use_obj_hash_agg):
     conf = {'spark.rapids.sql.hashAgg.replaceMode': replace_mode,
-            'spark.sql.adaptive.enabled': aqe_enabled}
+            'spark.sql.adaptive.enabled': aqe_enabled,
+            'spark.sql.execution.useObjectHashAggregateExec': use_obj_hash_agg}
     # test with single Distinct
     assert_cpu_and_gpu_are_equal_collect_with_capture(
         lambda spark: gen_df(spark, data_gen, length=100)
@@ -707,7 +929,7 @@ def test_hash_count_with_filter(data_gen, conf):
 @approximate_float
 @ignore_order
 @incompat
-@pytest.mark.parametrize('data_gen', _init_list_no_nans, ids=idfn)
+@pytest.mark.parametrize('data_gen', _init_list_no_nans + [_grpkey_short_mid_decimals, _grpkey_short_big_decimals], ids=idfn)
 @pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
 def test_hash_multiple_filters(data_gen, conf):
     assert_gpu_and_cpu_are_equal_sql(
@@ -820,29 +1042,23 @@ non_nan_all_basic_gens = [byte_gen, short_gen, int_gen, long_gen,
 
 _nested_gens = array_gens_sample + struct_gens_sample + map_gens_sample
 
-@pytest.mark.parametrize('data_gen', decimal_gens, ids=idfn)
-def test_first_last_reductions_extra_types(data_gen):
+@pytest.mark.parametrize('data_gen', decimal_gens + decimal_128_gens, ids=idfn)
+def test_first_last_reductions_decimal_types(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
-            # Coalesce and sort are to make sure that first and last, which are non-deterministic
-            # become deterministic
-            lambda spark : unary_op_df(spark, data_gen)\
-                    .coalesce(1).selectExpr(
-                'first(a)',
-                'last(a)'),
-            conf = allow_negative_scale_of_decimal_conf)
+        # Coalesce and sort are to make sure that first and last, which are non-deterministic
+        # become deterministic
+        lambda spark: unary_op_df(spark, data_gen).coalesce(1).selectExpr(
+            'first(a)', 'last(a)', 'first(a, true)', 'last(a, true)'),
+        conf=allow_negative_scale_of_decimal_conf)
 
-# TODO: https://github.com/NVIDIA/spark-rapids/issues/3221
-@allow_non_gpu('HashAggregateExec', 'SortAggregateExec',
-               'ShuffleExchangeExec', 'HashPartitioning',
-               'AggregateExpression', 'Alias', 'First', 'Last')
 @pytest.mark.parametrize('data_gen', _nested_gens, ids=idfn)
-def test_first_last_reductions_nested_types_fallback(data_gen):
-    assert_cpu_and_gpu_are_equal_collect_with_capture(
-            lambda spark: unary_op_df(spark, data_gen, num_slices=1)\
-                    .selectExpr('first(a)', 'last(a)', 'first(a, True)', 'last(a, True)'),
-            exist_classes='First,Last',
-            non_exist_classes='GpuFirst,GpuLast',
-            conf=allow_negative_scale_of_decimal_conf)
+def test_first_last_reductions_nested_types(data_gen):
+    assert_gpu_and_cpu_are_equal_collect(
+        # Coalesce and sort are to make sure that first and last, which are non-deterministic
+        # become deterministic
+        lambda spark: unary_op_df(spark, data_gen).coalesce(1).selectExpr(
+            'first(a)', 'last(a)', 'first(a, true)', 'last(a, true)'),
+        conf=allow_negative_scale_of_decimal_conf)
 
 @pytest.mark.parametrize('data_gen', non_nan_all_basic_gens, ids=idfn)
 @pytest.mark.parametrize('parameterless', ['true', pytest.param('false', marks=pytest.mark.xfail(
@@ -891,7 +1107,7 @@ def test_distinct_float_count_reductions(data_gen):
                 'count(DISTINCT a)'))
 
 @approximate_float
-@pytest.mark.parametrize('data_gen', numeric_gens, ids=idfn)
+@pytest.mark.parametrize('data_gen', numeric_gens + [decimal_gen_12_2, decimal_gen_18_3, decimal_gen_20_2], ids=idfn)
 def test_arithmetic_reductions(data_gen):
     assert_gpu_and_cpu_are_equal_collect(
             lambda spark : unary_op_df(spark, data_gen).selectExpr(
@@ -900,7 +1116,7 @@ def test_arithmetic_reductions(data_gen):
             conf = _no_nans_float_conf)
 
 @ignore_order(local=True)
-@pytest.mark.parametrize('data_gen', all_gen + _nested_gens, ids=idfn)
+@pytest.mark.parametrize('data_gen', all_gen + _nested_gens + decimal_128_gens, ids=idfn)
 def test_groupby_first_last(data_gen):
     gen_fn = [('a', RepeatSeqGen(LongGen(), length=20)), ('b', data_gen)]
     agg_fn = lambda df: df.groupBy('a').agg(
@@ -1088,51 +1304,141 @@ def test_agg_nested_map():
         return df.groupBy('a').agg(f.min(df.b[1]["a"]))
     assert_gpu_and_cpu_are_equal_collect(do_it)
 
-@pytest.mark.skip(reason="https://github.com/NVIDIA/spark-rapids/issues/3692")
-@ignore_order(local=True)
-def test_hash_groupby_approx_percentile_long_repeated_keys():
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_byte(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
+                                     ('v', ByteGen())], length=100),
+        [0.05, 0.25, 0.5, 0.75, 0.95], conf)
+
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_byte_scalar(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
+                                     ('v', ByteGen())], length=100),
+        0.5, conf)
+
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_long_repeated_keys(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
     compare_percentile_approx(
         lambda spark: gen_df(spark, [('k', RepeatSeqGen(LongGen(), length=20)),
                                      ('v', LongRangeGen())], length=100),
-        [0.05, 0.25, 0.5, 0.75, 0.95])
+        [0.05, 0.25, 0.5, 0.75, 0.95], conf)
 
-@pytest.mark.skip(reason="https://github.com/NVIDIA/spark-rapids/issues/3692")
-@ignore_order(local=True)
-def test_hash_groupby_approx_percentile_long():
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_long(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
     compare_percentile_approx(
         lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
                                      ('v', LongRangeGen())], length=100),
-        [0.05, 0.25, 0.5, 0.75, 0.95])
+        [0.05, 0.25, 0.5, 0.75, 0.95], conf)
 
-@pytest.mark.skip(reason="https://github.com/NVIDIA/spark-rapids/issues/3692")
-@ignore_order(local=True)
-def test_hash_groupby_approx_percentile_long_scalar():
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_long_single(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
     compare_percentile_approx(
         lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
                                      ('v', LongRangeGen())], length=100),
-        0.5)
+        0.5, conf)
 
-@pytest.mark.skip(reason="https://github.com/NVIDIA/spark-rapids/issues/3692")
-@ignore_order(local=True)
-def test_hash_groupby_approx_percentile_double():
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_double(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
     compare_percentile_approx(
         lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
                                      ('v', DoubleGen())], length=100),
+        [0.05, 0.25, 0.5, 0.75, 0.95], conf)
+
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+def test_hash_groupby_approx_percentile_double_single(aqe_enabled):
+    conf = {'spark.sql.adaptive.enabled': aqe_enabled}
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
+                                     ('v', DoubleGen())], length=100),
+        0.05, conf)
+
+@incompat
+@pytest.mark.parametrize('aqe_enabled', ['false', 'true'], ids=idfn)
+@ignore_order(local=True)
+@allow_non_gpu('TakeOrderedAndProjectExec', 'Alias', 'Cast', 'ObjectHashAggregateExec', 'AggregateExpression',
+    'ApproximatePercentile', 'Literal', 'ShuffleExchangeExec', 'HashPartitioning', 'CollectLimitExec')
+def test_hash_groupby_approx_percentile_partial_fallback_to_cpu(aqe_enabled):
+    conf = {
+        'spark.rapids.sql.hashAgg.replaceMode': 'partial',
+        'spark.sql.adaptive.enabled': aqe_enabled
+    }
+
+    def approx_percentile_query(spark):
+        df = gen_df(spark, [('k', StringGen(nullable=False)),
+                            ('v', DoubleGen())], length=100)
+        df.createOrReplaceTempView("t")
+        return spark.sql("select k, approx_percentile(v, array(0.1, 0.2)) from t group by k")
+
+    assert_gpu_fallback_collect(lambda spark: approx_percentile_query(spark), 'ApproximatePercentile', conf)
+
+@incompat
+@ignore_order(local=True)
+def test_hash_groupby_approx_percentile_decimal32():
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(6, 2))]),
         [0.05, 0.25, 0.5, 0.75, 0.95])
 
-@pytest.mark.skip(reason="https://github.com/NVIDIA/spark-rapids/issues/3692")
+@incompat
 @ignore_order(local=True)
-def test_hash_groupby_approx_percentile_double_scalar():
+def test_hash_groupby_approx_percentile_decimal32_single():
     compare_percentile_approx(
-        lambda spark: gen_df(spark, [('k', StringGen(nullable=False)),
-                                     ('v', DoubleGen())], length=100),
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(6, 2))]),
+        0.05)
+
+@incompat
+@ignore_order(local=True)
+def test_hash_groupby_approx_percentile_decimal64():
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(10, 9))]),
+        [0.05, 0.25, 0.5, 0.75, 0.95])
+
+@incompat
+@ignore_order(local=True)
+def test_hash_groupby_approx_percentile_decimal64_single():
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(10, 9))]),
+        0.05)
+
+@incompat
+@ignore_order(local=True)
+def test_hash_groupby_approx_percentile_decimal128():
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(19, 18))]),
+        [0.05, 0.25, 0.5, 0.75, 0.95])
+
+@incompat
+@ignore_order(local=True)
+def test_hash_groupby_approx_percentile_decimal128_single():
+    compare_percentile_approx(
+        lambda spark: gen_df(spark, [('k', RepeatSeqGen(ByteGen(nullable=False), length=2)),
+                                     ('v', DecimalGen(19, 18))]),
         0.05)
 
 # The percentile approx tests differ from other tests because we do not expect the CPU and GPU to produce the same
 # results due to the different algorithms being used. Instead we compute an exact percentile on the CPU and then
 # compute approximate percentiles on CPU and GPU and assert that the GPU numbers are accurate within some percentage
 # of the CPU numbers
-def compare_percentile_approx(df_fun, percentiles):
+def compare_percentile_approx(df_fun, percentiles, conf = {}):
 
     # create SQL statements for exact and approx percentiles
     p_exact_sql = create_percentile_sql("percentile", percentiles)
@@ -1149,28 +1455,40 @@ def compare_percentile_approx(df_fun, percentiles):
         return spark.sql(p_approx_sql)
 
     # run exact percentile on CPU
-    exact = run_with_cpu(run_exact, 'COLLECT', _approx_percentile_conf)
+    exact = run_with_cpu(run_exact, 'COLLECT', conf)
 
     # run approx_percentile on CPU and GPU
-    approx_cpu, approx_gpu = run_with_cpu_and_gpu(run_approx, 'COLLECT', _approx_percentile_conf)
+    approx_cpu, approx_gpu = run_with_cpu_and_gpu(run_approx, 'COLLECT', conf)
 
-    for result in zip(exact, approx_cpu, approx_gpu):
+    assert len(exact) == len(approx_cpu)
+    assert len(exact) == len(approx_gpu)
+
+    for i in range(len(exact)):
+        cpu_exact_result = exact[i]
+        cpu_approx_result = approx_cpu[i]
+        gpu_approx_result = approx_gpu[i]
+
         # assert that keys match
-        assert result[0]['k'] == result[1]['k']
-        assert result[1]['k'] == result[2]['k']
+        assert cpu_exact_result['k'] == cpu_approx_result['k']
+        assert cpu_exact_result['k'] == gpu_approx_result['k']
 
-        exact = result[0]['the_percentile']
-        cpu = result[1]['the_percentile']
-        gpu = result[2]['the_percentile']
+        # extract the percentile result column
+        exact_percentile = cpu_exact_result['the_percentile']
+        cpu_approx_percentile = cpu_approx_result['the_percentile']
+        gpu_approx_percentile = gpu_approx_result['the_percentile']
 
-        if exact is not None:
-            if isinstance(exact, list):
-                for x in zip(exact, cpu, gpu):
-                    exact = x[0]
-                    cpu = x[1]
-                    gpu = x[2]
-                    gpu_delta = abs(float(gpu) - float(exact))
-                    cpu_delta = abs(float(cpu) - float(exact))
+        if exact_percentile is None:
+            assert cpu_approx_percentile is None
+            assert gpu_approx_percentile is None
+        else:
+            assert cpu_approx_percentile is not None
+            assert gpu_approx_percentile is not None
+            if isinstance(exact_percentile, list):
+                for j in range(len(exact_percentile)):
+                    assert cpu_approx_percentile[j] is not None
+                    assert gpu_approx_percentile[j] is not None
+                    gpu_delta = abs(float(gpu_approx_percentile[j]) - float(exact_percentile[j]))
+                    cpu_delta = abs(float(cpu_approx_percentile[j]) - float(exact_percentile[j]))
                     if gpu_delta > cpu_delta:
                         # GPU is less accurate so make sure we are within some tolerance
                         if gpu_delta == 0:
@@ -1178,8 +1496,8 @@ def compare_percentile_approx(df_fun, percentiles):
                         else:
                             assert abs(cpu_delta / gpu_delta) - 1 < 0.001
             else:
-                gpu_delta = abs(float(gpu) - float(exact))
-                cpu_delta = abs(float(cpu) - float(exact))
+                gpu_delta = abs(float(gpu_approx_percentile) - float(exact_percentile))
+                cpu_delta = abs(float(cpu_approx_percentile) - float(exact_percentile))
                 if gpu_delta > cpu_delta:
                     # GPU is less accurate so make sure we are within some tolerance
                     if gpu_delta == 0:
@@ -1189,10 +1507,10 @@ def compare_percentile_approx(df_fun, percentiles):
 
 def create_percentile_sql(func_name, percentiles):
     if isinstance(percentiles, list):
-        return """select k, {}(v, array({})) as the_percentile from t group by k""".format(
+        return """select k, {}(v, array({})) as the_percentile from t group by k order by k""".format(
             func_name, ",".join(str(i) for i in percentiles))
     else:
-        return """select k, {}(v, {}) as the_percentile from t group by k""".format(
+        return """select k, {}(v, {}) as the_percentile from t group by k order by k""".format(
             func_name, percentiles)
 
 @ignore_order
@@ -1303,7 +1621,6 @@ def test_no_fallback_when_ansi_enabled(data_gen):
 @pytest.mark.parametrize('conf', get_params(_confs, params_markers_for_confs), ids=idfn)
 def test_groupby_std_variance(data_gen, conf):
     local_conf = copy_and_update(conf, {
-        'spark.rapids.sql.decimalType.enabled': 'true',
         'spark.rapids.sql.castDecimalToFloat.enabled': 'true'})
     assert_gpu_and_cpu_are_equal_sql(
         lambda spark : gen_df(spark, data_gen, length=1000),
@@ -1380,3 +1697,46 @@ def test_groupby_std_variance_partial_replace_fallback(data_gen,
         exist_classes=','.join(exist_clz),
         non_exist_classes=','.join(non_exist_clz),
         conf=local_conf)
+
+#
+# test min max on single level structure
+#
+gens_for_max_min = [byte_gen, short_gen, int_gen, long_gen,
+    FloatGen(no_nans = True), DoubleGen(no_nans = True),
+    string_gen, boolean_gen,
+    date_gen, timestamp_gen,
+    DecimalGen(precision=12, scale=2),
+    DecimalGen(precision=36, scale=5),
+    null_gen]
+@ignore_order(local=True)
+@pytest.mark.parametrize('data_gen',  gens_for_max_min, ids=idfn)
+def test_min_max_for_single_level_struct(data_gen):
+    df_gen = [
+        ('a', StructGen([
+                ('aa', data_gen),
+                ('ab', data_gen)])),
+        ('b', RepeatSeqGen(IntegerGen(), length=20))]
+
+    # test max
+    assert_gpu_and_cpu_are_equal_sql(
+        lambda spark : gen_df(spark, df_gen),
+        "hash_agg_table",
+        'select b, max(a) from hash_agg_table group by b',
+        _no_nans_float_conf)
+    assert_gpu_and_cpu_are_equal_sql(
+        lambda spark : gen_df(spark, df_gen),
+        "hash_agg_table",
+        'select max(a) from hash_agg_table',
+        _no_nans_float_conf)
+
+    # test min
+    assert_gpu_and_cpu_are_equal_sql(
+        lambda spark : gen_df(spark, df_gen, length=1024),
+        "hash_agg_table",
+        'select b, min(a) from hash_agg_table group by b',
+        _no_nans_float_conf)
+    assert_gpu_and_cpu_are_equal_sql(
+        lambda spark : gen_df(spark, df_gen, length=1024),
+        "hash_agg_table",
+        'select min(a) from hash_agg_table',
+        _no_nans_float_conf)

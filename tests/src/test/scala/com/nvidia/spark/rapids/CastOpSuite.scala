@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -236,7 +236,6 @@ class CastOpSuite extends GpuExpressionTestSuite {
       .set(RapidsConf.INCOMPATIBLE_DATE_FORMATS.key, "true")
       .set(RapidsConf.ENABLE_CAST_STRING_TO_TIMESTAMP.key, "true")
       .set(RapidsConf.ENABLE_CAST_STRING_TO_FLOAT.key, "true")
-      .set(RapidsConf.ENABLE_CAST_STRING_TO_DECIMAL.key, "true")
       // Tests that this is not true for are skipped in 3.2.0+
       .set(RapidsConf.HAS_EXTENDED_YEAR_VALUES.key, "false")
 
@@ -450,7 +449,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
     sqlCtx.setConf("spark.sql.legacy.allowNegativeScaleOfDecimal", "true")
     sqlCtx.setConf("spark.rapids.sql.castDecimalToString.enabled", "true")
 
-    Seq(10, 15, 18).foreach { precision =>
+    Seq(10, 15, 28).foreach { precision =>
       Seq(-precision, -5, 0, 5, precision).foreach { scale =>
         testCastToString(DataTypes.createDecimalType(precision, scale),
           comparisonFunc = Some(compareStringifiedDecimalsInSemantic))
@@ -717,10 +716,10 @@ class CastOpSuite extends GpuExpressionTestSuite {
   test("cast decimal to decimal") {
     // fromScale == toScale
     testCastToDecimal(DataTypes.createDecimalType(18, 0),
-      scale = 0,
+      scale = 0, precision = 18,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(18, 2),
-      scale = 2,
+      scale = 2, precision = 18,
       ansiEnabled = true,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(18, 2),
@@ -739,7 +738,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
       scale = -1,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(18, 10),
-      scale = 2,
+      scale = 2, precision = 18,
       ansiEnabled = true,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(18, 10),
@@ -749,7 +748,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
       precision = 18, scale = 15,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(8, 1),
-      scale = -1,
+      scale = -1, precision = 18,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(8, 7),
       precision = 5, scale = 2,
@@ -760,7 +759,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
 
     // fromScale < toScale
     testCastToDecimal(DataTypes.createDecimalType(18, 0),
-      scale = 3,
+      scale = 3, precision = 18,
       customRandGenerator = Some(new scala.util.Random(1234L)))
     testCastToDecimal(DataTypes.createDecimalType(9, 5),
       precision = 18, scale = 10,
@@ -876,10 +875,29 @@ class CastOpSuite extends GpuExpressionTestSuite {
   }
 
   test("cast string to decimal") {
-    List(-18, -10, -3, 0, 1, 5, 15).foreach { scale =>
+    // We are limiting the negative scale because of a bug in Spark where it wrongly
+    // assumes a Decimal value won't be represented by a given scale when in fact it can be
+    // Example:
+    // 7.836725755512218E38 can be represented as Decimal(37, -17) but Spark has a check
+    // (precision + scale > DecimalType.MAX_PRECISION), in this case (37 + 17) > 38, stops it from
+    // being casted that was introduced in 3.1.1 as a performance enhancement but introduced a
+    // regression.
+    // There is a bug filed against it in Spark https://issues.apache.org/jira/browse/SPARK-37451
+
+    List(-1, 0, 1, 5, 15).foreach { scale =>
+      if (cmpSparkVersion(3, 1, 1) < 0 || scale >= 0) {
+        testCastToDecimal(DataTypes.StringType, scale, precision = 37,
+          customRandGenerator = Some(new scala.util.Random(1234L)))
+      }
+    }
+  }
+
+  test("cast string to decimal (fail)") {
+    assertThrows[IllegalArgumentException](
+    List(-38, 38, 2, 32, 8).foreach { scale =>
       testCastToDecimal(DataTypes.StringType, scale,
         customRandGenerator = Some(new scala.util.Random(1234L)))
-    }
+    })
   }
 
   test("cast string to decimal (include NaN/INF/-INF)") {
@@ -888,9 +906,14 @@ class CastOpSuite extends GpuExpressionTestSuite {
       val df2 = doublesAsStrings(ss).select(col("c0").as("col"))
       df1.unionAll(df2)
     }
-    List(-10, -1, 0, 1, 10).foreach { scale =>
-      testCastToDecimal(DataTypes.StringType, scale = scale,
-        customDataGenerator = Some(doubleStrings))
+    // Similar to the test above we are limiting the negative scale
+    // There is a bug filed against it in Spark https://issues.apache.org/jira/browse/SPARK-37451
+
+    List(-1, 0, 1, 10).foreach { scale =>
+      if (cmpSparkVersion(3, 1, 1) < 0 || scale >= 0) {
+        testCastToDecimal(DataTypes.StringType, scale = scale, precision = 37,
+          customDataGenerator = Some(doubleStrings))
+      }
     }
   }
 
@@ -899,16 +922,19 @@ class CastOpSuite extends GpuExpressionTestSuite {
       import ss.sqlContext.implicits._
       column.toDF("col")
     }
-    testCastToDecimal(DataTypes.StringType, scale = 7,
+
+    testCastToDecimal(DataTypes.StringType, scale = 7, precision = 37,
       customDataGenerator = Some(specialGenerator(Seq("9999999999"))))
-    testCastToDecimal(DataTypes.StringType, scale = 2,
+    testCastToDecimal(DataTypes.StringType, scale = 2, precision = 37,
       customDataGenerator = Some(specialGenerator(Seq("999999999999999"))))
-    testCastToDecimal(DataTypes.StringType, scale = 0,
+    testCastToDecimal(DataTypes.StringType, scale = 0, precision = 37,
       customDataGenerator = Some(specialGenerator(Seq("99999999999999999"))))
-    testCastToDecimal(DataTypes.StringType, scale = -1,
-      customDataGenerator = Some(specialGenerator(Seq("99999999999999999"))))
-    testCastToDecimal(DataTypes.StringType, scale = -10,
-      customDataGenerator = Some(specialGenerator(Seq("99999999999999999"))))
+    if (cmpSparkVersion(3, 1, 1) < 0) {
+      testCastToDecimal(DataTypes.StringType, scale = -1, precision = 37,
+        customDataGenerator = Some(specialGenerator(Seq("99999999999999999"))))
+      testCastToDecimal(DataTypes.StringType, scale = -10, precision = 37,
+        customDataGenerator = Some(specialGenerator(Seq("99999999999999999"))))
+    }
   }
 
   test("ansi_cast string to decimal exp") {
@@ -916,18 +942,21 @@ class CastOpSuite extends GpuExpressionTestSuite {
       exponentsAsStringsDf(ss).select(col("c0").as("col"))
     }
     List(-10, -1, 0, 1, 10).foreach { scale =>
-      testCastToDecimal(DataTypes.StringType, scale = scale,
-        customDataGenerator = Some(exponentsAsStrings),
-        ansiEnabled = true)
+      if (cmpSparkVersion(3, 1, 1) < 0 || scale >= 0) {
+        testCastToDecimal(DataTypes.StringType, scale = scale, precision = 37,
+          customDataGenerator = Some(exponentsAsStrings),
+          ansiEnabled = true)
+      }
     }
   }
 
   test("CAST string to float - sanitize step") {
     val testPairs = Seq(
-      ("\tinf", "Inf"),
-      ("\t+InFinITy", "Inf"),
-      ("\tInFinITy", "Inf"),
-      ("\t-InFinITy", "-Inf"),
+      ("\tinf", "inf"),
+      ("\riNf", "iNf"),
+      ("\t+InFinITy", "+InFinITy"),
+      ("\tInFinITy", "InFinITy"),
+      ("\t-InFinITy", "-InFinITy"),
       ("\t61f", "61"),
       (".8E4f", ".8E4")
     )
@@ -969,8 +998,8 @@ class CastOpSuite extends GpuExpressionTestSuite {
   protected def testCastToDecimal(
     dataType: DataType,
     scale: Int,
-    precision: Int = ai.rapids.cudf.DType.DECIMAL64_MAX_PRECISION,
-    maxFloatDiff: Double = 1e-9,
+    precision: Int = ai.rapids.cudf.DType.DECIMAL128_MAX_PRECISION,
+    floatEpsilon: Double = 1e-9,
     customDataGenerator: Option[SparkSession => DataFrame] = None,
     customRandGenerator: Option[scala.util.Random] = None,
     ansiEnabled: Boolean = false,
@@ -982,9 +1011,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
 
     try {
       val conf = new SparkConf()
-        .set(RapidsConf.DECIMAL_TYPE_ENABLED.key, "true")
         .set(RapidsConf.ENABLE_CAST_FLOAT_TO_DECIMAL.key, "true")
-        .set(RapidsConf.ENABLE_CAST_STRING_TO_DECIMAL.key, "true")
         .set("spark.rapids.sql.exec.FileSourceScanExec", "false")
         .set("spark.sql.legacy.allowNegativeScaleOfDecimal", "true")
         .set("spark.sql.ansi.enabled", ansiEnabled.toString)
@@ -1005,7 +1032,7 @@ class CastOpSuite extends GpuExpressionTestSuite {
         val (fromCpu, fromGpu) = runOnCpuAndGpu(createDF, execFun, conf, repart = 0)
         val (cpuResult, gpuResult) = dataType match {
           case ShortType | IntegerType | LongType | _: DecimalType =>
-            fromCpu.map(r => Row(r.getDecimal(1))) -> fromGpu.map(r => Row(r.getDecimal(1)))
+            (fromCpu, fromGpu)
           case FloatType | DoubleType | StringType =>
             // There may be tiny difference between CPU and GPU result when casting from double
             val fetchFromRow = (r: Row) => {
@@ -1014,12 +1041,12 @@ class CastOpSuite extends GpuExpressionTestSuite {
             }
             fromCpu.map(r => Row(fetchFromRow(r))) -> fromGpu.map(r => Row(fetchFromRow(r)))
         }
-        compareResults(sort = false, maxFloatDiff, cpuResult, gpuResult)
+        compareResults(sort = false, floatEpsilon, cpuResult, gpuResult)
       } else {
         withGpuSparkSession((ss: SparkSession) => execFun(createDF(ss)).collect(), conf)
       }
     } finally {
-      dir.delete()
+      org.apache.commons.io.FileUtils.deleteQuietly(dir)
     }
   }
 
@@ -1385,6 +1412,12 @@ object CastOpSuite {
   def validTimestamps(session: SparkSession): DataFrame = {
     import session.sqlContext.implicits._
     val timestampStrings = Seq(
+      "8669-07-22T04:45:57.73",
+      "6233-08-04T19:30:55.701",
+      "8220-02-25T10:01:15.106",
+      "9754-01-21T16:53:02.137",
+      "7649-11-16T15:56:04.996",
+      "7027-04-09T15:08:52.627",
       "1920-12-31T11:59:59.999",
       "1969-12-31T23:59:59.999",
       "1969-12-31T23:59:59.999999",

@@ -20,7 +20,7 @@ import java.time.ZoneId
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, BinaryExpression, ComplexTypeMergingExpression, Expression, String2TrimExpression, TernaryExpression, UnaryExpression, WindowExpression, WindowFunction}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, BinaryExpression, ComplexTypeMergingExpression, Expression, QuaternaryExpression, String2TrimExpression, TernaryExpression, UnaryExpression, WindowExpression, WindowFunction}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateFunction, ImperativeAggregate, TypedImperativeAggregate}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
@@ -46,11 +46,15 @@ trait DataFromReplacementRule {
  * A version of DataFromReplacementRule that is used when no replacement rule can be found.
  */
 final class NoRuleDataFromReplacementRule extends DataFromReplacementRule {
-  override val operationName: String = "NOT_FOUND"
+  override val operationName: String = ""
 
   override def confKey = "NOT_FOUND"
 
   override def getChecks: Option[TypeChecks[_]] = None
+}
+
+object RapidsMeta {
+  val gpuSupportedTag = TreeNodeTag[Set[String]]("rapids.gpu.supported")
 }
 
 /**
@@ -111,7 +115,7 @@ abstract class RapidsMeta[INPUT <: BASE, BASE, OUTPUT <: BASE](
    */
   def convertToCpu(): BASE = wrapped
 
-  private var cannotBeReplacedReasons: Option[mutable.Set[String]] = None
+  protected var cannotBeReplacedReasons: Option[mutable.Set[String]] = None
   private var mustBeReplacedReasons: Option[mutable.Set[String]] = None
   private var cannotReplaceAnyOfPlanReasons: Option[mutable.Set[String]] = None
   private var shouldBeRemovedReasons: Option[mutable.Set[String]] = None
@@ -119,7 +123,7 @@ abstract class RapidsMeta[INPUT <: BASE, BASE, OUTPUT <: BASE](
   protected var cannotRunOnGpuBecauseOfSparkPlan: Boolean = false
   protected var cannotRunOnGpuBecauseOfCost: Boolean = false
 
-  val gpuSupportedTag = TreeNodeTag[Set[String]]("rapids.gpu.supported")
+  import RapidsMeta.gpuSupportedTag
 
   /**
    * Recursively force a section of the plan back onto CPU, stopping once a plan
@@ -363,7 +367,7 @@ abstract class RapidsMeta[INPUT <: BASE, BASE, OUTPUT <: BASE](
 
   protected def checkTimeZoneId(timeZoneId: Option[String]): Unit = {
     timeZoneId.foreach { zoneId =>
-      if (ZoneId.of(zoneId).normalized() != GpuOverrides.UTC_TIMEZONE_ID) {
+      if (!TypeChecks.areTimestampsSupported(ZoneId.systemDefault())) {
         willNotWorkOnGpu(s"Only UTC zone id is supported. Actual zone id: $zoneId")
       }
     }
@@ -459,7 +463,7 @@ final class RuleNotFoundPartMeta[INPUT <: Partitioning](
   extends PartMeta[INPUT](part, conf, parent, new NoRuleDataFromReplacementRule) {
 
   override def tagPartForGpu(): Unit = {
-    willNotWorkOnGpu(s"no GPU enabled version of partitioning ${part.getClass} could be found")
+    willNotWorkOnGpu(s"GPU does not currently support the operator ${part.getClass}")
   }
 
   override def convertToGpu(): GpuPartitioning =
@@ -494,7 +498,7 @@ final class RuleNotFoundScanMeta[INPUT <: Scan](
   extends ScanMeta[INPUT](scan, conf, parent, new NoRuleDataFromReplacementRule) {
 
   override def tagSelfForGpu(): Unit = {
-    willNotWorkOnGpu(s"no GPU enabled version of scan ${scan.getClass} could be found")
+    willNotWorkOnGpu(s"GPU does not currently support the operator ${scan.getClass}")
   }
 
   override def convertToGpu(): Scan =
@@ -530,7 +534,7 @@ final class RuleNotFoundDataWritingCommandMeta[INPUT <: DataWritingCommand](
     extends DataWritingCommandMeta[INPUT](cmd, conf, parent, new NoRuleDataFromReplacementRule) {
 
   override def tagSelfForGpu(): Unit = {
-    willNotWorkOnGpu(s"no GPU accelerated version of command ${cmd.getClass} could be found")
+    willNotWorkOnGpu(s"GPU does not currently support the operator ${cmd.getClass}")
   }
 
   override def convertToGpu(): GpuDataWritingCommand =
@@ -677,7 +681,19 @@ abstract class SparkPlanMeta[INPUT <: SparkPlan](plan: INPUT,
       willNotWorkOnGpu("not all data writing commands can be replaced")
     }
 
+    checkExistingTags()
+
     tagPlanForGpu()
+  }
+
+  /**
+   * When AQE is enabled and we are planning a new query stage, we need to look at meta-data
+   * previously stored on the spark plan to determine whether this operator can run on GPU
+   */
+  def checkExistingTags(): Unit = {
+    wrapped.getTagValue(RapidsMeta.gpuSupportedTag)
+      .foreach(_.diff(cannotBeReplacedReasons.get)
+      .foreach(willNotWorkOnGpu))
   }
 
   /**
@@ -779,7 +795,7 @@ final class RuleNotFoundSparkPlanMeta[INPUT <: SparkPlan](
   extends SparkPlanMeta[INPUT](plan, conf, parent, new NoRuleDataFromReplacementRule) {
 
   override def tagPlanForGpu(): Unit =
-    willNotWorkOnGpu(s"no GPU enabled version of operator ${plan.getClass} could be found")
+    willNotWorkOnGpu(s"GPU does not currently support the operator ${plan.getClass}")
 
   override def convertToGpu(): GpuExec =
     throw new IllegalStateException("Cannot be converted to GPU")
@@ -926,6 +942,8 @@ abstract class BaseExprMeta[INPUT <: Expression](
 
   override val printWrapped: Boolean = true
 
+  def dataType: DataType = expr.dataType
+
   val ignoreUnsetDataTypes = false
 
   override def canExprTreeBeReplaced: Boolean =
@@ -959,8 +977,10 @@ abstract class BaseExprMeta[INPUT <: Expression](
     case _ => ExpressionContext.getRegularOperatorContext(this)
   }
 
+  val isFoldableNonLitAllowed: Boolean = false
+
   final override def tagSelfForGpu(): Unit = {
-    if (wrapped.foldable && !GpuOverrides.isLit(wrapped)) {
+    if (wrapped.foldable && !GpuOverrides.isLit(wrapped) && !isFoldableNonLitAllowed) {
       willNotWorkOnGpu(s"Cannot run on GPU. Is ConstantFolding excluded? Expression " +
         s"$wrapped is foldable and operates on non literals")
     }
@@ -1076,6 +1096,16 @@ abstract class UnaryExprMeta[INPUT <: UnaryExpression](
     convertToGpu(childExprs.head.convertToGpu())
 
   def convertToGpu(child: Expression): GpuExpression
+
+  /**
+   * `ConstantFolding` executes early in the logical plan process, which
+   * simplifies many things before we get to the physical plan. If you enable
+   * AQE, some optimizations can cause new expressions to show up that would have been
+   * folded in by the logical plan optimizer (like `cast(null as bigint)` which just
+   * becomes Literal(null, Long) after `ConstantFolding`), so enabling this here
+   * allows us to handle these when they are generated by an AQE rule.
+   */
+  override val isFoldableNonLitAllowed: Boolean = true
 }
 
 /** Base metadata class for unary expressions that support conversion to AST as well */
@@ -1228,6 +1258,25 @@ abstract class TernaryExprMeta[INPUT <: TernaryExpression](
                    val2: Expression): GpuExpression
 }
 
+/**
+ * Base class for metadata around `QuaternaryExpression`.
+ */
+abstract class QuaternaryExprMeta[INPUT <: QuaternaryExpression](
+    expr: INPUT,
+    conf: RapidsConf,
+    parent: Option[RapidsMeta[_, _, _]],
+    rule: DataFromReplacementRule)
+  extends ExprMeta[INPUT](expr, conf, parent, rule) {
+
+  override final def convertToGpu(): GpuExpression = {
+    val Seq(child0, child1, child2, child3) = childExprs.map(_.convertToGpu())
+    convertToGpu(child0, child1, child2, child3)
+  }
+
+  def convertToGpu(val0: Expression, val1: Expression,
+    val2: Expression, val3: Expression): GpuExpression
+}
+
 abstract class String2TrimExpressionMeta[INPUT <: String2TrimExpression](
     expr: INPUT,
     conf: RapidsConf,
@@ -1268,7 +1317,7 @@ final class RuleNotFoundExprMeta[INPUT <: Expression](
   extends ExprMeta[INPUT](expr, conf, parent, new NoRuleDataFromReplacementRule) {
 
   override def tagExprForGpu(): Unit =
-    willNotWorkOnGpu(s"no GPU enabled version of expression ${expr.getClass} could be found")
+    willNotWorkOnGpu(s"GPU does not currently support the operator ${expr.getClass}")
 
   override def convertToGpu(): GpuExpression =
     throw new IllegalStateException("Cannot be converted to GPU")

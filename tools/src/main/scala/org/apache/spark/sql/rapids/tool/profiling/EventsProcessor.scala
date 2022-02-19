@@ -31,76 +31,8 @@ import org.apache.spark.sql.rapids.tool.EventProcessorBase
 /**
  * This class is to process all events and do validation in the end.
  */
-class EventsProcessor() extends EventProcessorBase with  Logging {
-
-  type T = ApplicationInfo
-
-  override def processAnyEvent(app: T, event: SparkListenerEvent): Unit = {
-    event match {
-      case _: SparkListenerLogStart =>
-        doSparkListenerLogStart(app, event.asInstanceOf[SparkListenerLogStart])
-      case _: SparkListenerBlockManagerAdded =>
-        doSparkListenerBlockManagerAdded(app,
-          event.asInstanceOf[SparkListenerBlockManagerAdded])
-      case _: SparkListenerBlockManagerRemoved =>
-        doSparkListenerBlockManagerRemoved(app,
-          event.asInstanceOf[SparkListenerBlockManagerRemoved])
-      case _: SparkListenerEnvironmentUpdate =>
-        doSparkListenerEnvironmentUpdate(app,
-          event.asInstanceOf[SparkListenerEnvironmentUpdate])
-      case _: SparkListenerApplicationStart =>
-        doSparkListenerApplicationStart(app,
-          event.asInstanceOf[SparkListenerApplicationStart])
-      case _: SparkListenerApplicationEnd =>
-        doSparkListenerApplicationEnd(app,
-          event.asInstanceOf[SparkListenerApplicationEnd])
-      case _: SparkListenerExecutorAdded =>
-        doSparkListenerExecutorAdded(app,
-          event.asInstanceOf[SparkListenerExecutorAdded])
-      case _: SparkListenerExecutorRemoved =>
-        doSparkListenerExecutorRemoved(app,
-          event.asInstanceOf[SparkListenerExecutorRemoved])
-      case _: SparkListenerTaskStart =>
-        doSparkListenerTaskStart(app,
-          event.asInstanceOf[SparkListenerTaskStart])
-      case _: SparkListenerTaskEnd =>
-        doSparkListenerTaskEnd(app,
-          event.asInstanceOf[SparkListenerTaskEnd])
-      case _: SparkListenerSQLExecutionStart =>
-        doSparkListenerSQLExecutionStart(app,
-          event.asInstanceOf[SparkListenerSQLExecutionStart])
-      case _: SparkListenerSQLExecutionEnd =>
-        doSparkListenerSQLExecutionEnd(app,
-          event.asInstanceOf[SparkListenerSQLExecutionEnd])
-      case _: SparkListenerDriverAccumUpdates =>
-        doSparkListenerDriverAccumUpdates(app,
-          event.asInstanceOf[SparkListenerDriverAccumUpdates])
-      case _: SparkListenerJobStart =>
-        doSparkListenerJobStart(app,
-          event.asInstanceOf[SparkListenerJobStart])
-      case _: SparkListenerJobEnd =>
-        doSparkListenerJobEnd(app,
-          event.asInstanceOf[SparkListenerJobEnd])
-      case _: SparkListenerStageSubmitted =>
-        doSparkListenerStageSubmitted(app,
-          event.asInstanceOf[SparkListenerStageSubmitted])
-      case _: SparkListenerStageCompleted =>
-        doSparkListenerStageCompleted(app,
-          event.asInstanceOf[SparkListenerStageCompleted])
-      case _: SparkListenerTaskGettingResult =>
-        doSparkListenerTaskGettingResult(app,
-          event.asInstanceOf[SparkListenerTaskGettingResult])
-      case _: SparkListenerSQLAdaptiveExecutionUpdate =>
-        doSparkListenerSQLAdaptiveExecutionUpdate(app,
-          event.asInstanceOf[SparkListenerSQLAdaptiveExecutionUpdate])
-      case _: SparkListenerSQLAdaptiveSQLMetricUpdates =>
-        doSparkListenerSQLAdaptiveSQLMetricUpdates(app,
-          event.asInstanceOf[SparkListenerSQLAdaptiveSQLMetricUpdates])
-      case _ =>
-        val wasResourceProfileAddedEvent = doSparkListenerResourceProfileAddedReflect(app, event)
-        if (!wasResourceProfileAddedEvent) doOtherEvent(app, event)
-    }
-  }
+class EventsProcessor(app: ApplicationInfo) extends EventProcessorBase[ApplicationInfo](app)
+  with Logging {
 
   override def doSparkListenerResourceProfileAddedReflect(
       app: ApplicationInfo,
@@ -258,10 +190,11 @@ class EventsProcessor() extends EventProcessorBase with  Logging {
     // Parse task accumulables
     for (res <- event.taskInfo.accumulables) {
       try {
-        val value = res.value.getOrElse(0L).toString.toLong
+        val value = res.value.map(_.toString.toLong)
+        val update = res.update.map(_.toString.toLong)
         val thisMetric = TaskStageAccumCase(
           event.stageId, event.stageAttemptId, Some(event.taskInfo.taskId),
-          res.id, res.name, Some(value), res.internal)
+          res.id, res.name, value, update, res.internal)
         val arrBuf =  app.taskStageAccumMap.getOrElseUpdate(res.id,
           ArrayBuffer[TaskStageAccumCase]())
         app.accumIdToStageId.put(res.id, event.stageId)
@@ -273,7 +206,7 @@ class EventsProcessor() extends EventProcessorBase with  Logging {
             + ": ")
           logWarning(e.toString)
           logWarning("The problematic accumulable is: name="
-            + res.name + ",value=" + res.value)
+            + res.name + ",value=" + res.value + ",update=" + res.update)
       }
     }
 
@@ -332,7 +265,7 @@ class EventsProcessor() extends EventProcessorBase with  Logging {
       event.time,
       None,
       None,
-      hasDataset = false,
+      hasDatasetOrRDD = false,
       ""
     )
     app.sqlIdToInfo.put(event.executionId, sqlExecution)
@@ -454,10 +387,11 @@ class EventsProcessor() extends EventProcessorBase with  Logging {
     // Parse stage accumulables
     for (res <- event.stageInfo.accumulables) {
       try {
-        val value = res._2.value.getOrElse("").toString.toLong
+        val value = res._2.value.map(_.toString.toLong)
+        val update = res._2.update.map(_.toString.toLong)
         val thisMetric = TaskStageAccumCase(
           event.stageInfo.stageId, event.stageInfo.attemptNumber(),
-          None, res._2.id, res._2.name, Some(value), res._2.internal)
+          None, res._2.id, res._2.name, value, update, res._2.internal)
         val arrBuf =  app.taskStageAccumMap.getOrElseUpdate(res._2.id,
           ArrayBuffer[TaskStageAccumCase]())
         app.accumIdToStageId.put(res._2.id, event.stageInfo.stageId)
@@ -468,7 +402,7 @@ class EventsProcessor() extends EventProcessorBase with  Logging {
               "stageID=" + event.stageInfo.stageId + ": ")
           logWarning(e.toString)
           logWarning("The problematic accumulable is: name="
-              + res._2.name + ",value=" + res._2.value)
+              + res._2.name + ",value=" + res._2.value + ",update=" + res._2.update)
       }
     }
   }

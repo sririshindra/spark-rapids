@@ -131,7 +131,7 @@ class SQLExecutionInfoClass(
     val startTime: Long,
     var endTime: Option[Long],
     var duration: Option[Long],
-    var hasDataset: Boolean,
+    var hasDatasetOrRDD: Boolean,
     var problematic: String = "",
     var sqlCpuTimePercent: Double = -1)
 
@@ -251,7 +251,10 @@ case class TaskStageAccumCase(
     taskId: Option[Long],
     accumulatorId: Long,
     name: Option[String],
+    // The total accumulated so far for all tasks
     value: Option[Long],
+    // The amount for this particular task/update
+    update: Option[Long],
     isInternal: Boolean)
 
 // Note: sr = Shuffle Read; sw = Shuffle Write
@@ -526,7 +529,7 @@ case class SQLDurationExecutorTimeProfileResult(appIndex: Int, appId: String, sq
     duration: Option[Long], containsDataset: Boolean, appDuration: Option[Long],
     potentialProbs: String, executorCpuRatio: Double) extends ProfileResult {
   override val outputHeaders = Seq("appIndex", "App ID", "sqlID", "SQL Duration",
-    "Contains Dataset Op", "App Duration", "Potential Problems", "Executor CPU Time Percent")
+    "Contains Dataset or RDD Op", "App Duration", "Potential Problems", "Executor CPU Time Percent")
   val durStr = duration match {
     case Some(dur) => dur.toString
     case None => ""

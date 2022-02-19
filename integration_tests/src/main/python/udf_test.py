@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION.
+# Copyright (c) 2020-2022, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 import pytest
 
 from conftest import is_at_least_precommit_run
+from spark_session import is_databricks91_or_later
 
 from pyspark.sql.pandas.utils import require_minimum_pyarrow_version, require_minimum_pandas_version
 try:
@@ -40,9 +41,6 @@ import pyspark.sql.functions as f
 import pandas as pd
 from typing import Iterator, Tuple
 
-# Mark all tests in current file as premerge_ci_1 in order to be run in first k8s pod for parallel build premerge job
-pytestmark = pytest.mark.premerge_ci_1
-
 arrow_udf_conf = {
     'spark.sql.execution.arrow.pyspark.enabled': 'true',
     'spark.rapids.sql.exec.WindowInPandasExec': 'true',
@@ -59,14 +57,13 @@ data_gens_nested_for_udf = arrow_array_gens + arrow_struct_gens
 # itself.
 ####################################################################
 
-
 @pytest.mark.parametrize('data_gen', integral_gens, ids=idfn)
 def test_pandas_math_udf(data_gen):
     def add(a, b):
         return a + b
     my_udf = f.pandas_udf(add, returnType=LongType())
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : binary_op_df(spark, data_gen).select(
+            lambda spark : binary_op_df(spark, data_gen, num_slices=4).select(
                 my_udf(f.col('a') - 3, f.col('b'))),
             conf=arrow_udf_conf)
 
@@ -79,7 +76,7 @@ def test_iterator_math_udf(data_gen):
 
     my_udf = f.pandas_udf(iterator_add, returnType=LongType())
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : binary_op_df(spark, data_gen).select(
+            lambda spark : binary_op_df(spark, data_gen, num_slices=4).select(
                 my_udf(f.col('a'), f.col('b'))),
             conf=arrow_udf_conf)
 
@@ -91,7 +88,7 @@ def test_pandas_scalar_udf_nested_type(data_gen):
 
     my_udf = f.pandas_udf(nested_size, returnType=LongType())
     assert_gpu_and_cpu_are_equal_collect(
-        lambda spark: unary_op_df(spark, data_gen).select(my_udf(f.col('a'))),
+        lambda spark: unary_op_df(spark, data_gen, num_slices=4).select(my_udf(f.col('a'))),
         conf=arrow_udf_conf)
 
 
@@ -216,7 +213,31 @@ def test_window_aggregate_udf_array_from_python(data_gen, window):
 
 
 # ======= Test flat map group in Pandas =======
-@ignore_order
+
+# separate the tests into before and after db 91. To verify
+# the new "zero-conf-conversion" feature introduced from db 9.1.
+@pytest.mark.skipif(not is_databricks91_or_later(), reason="zero-conf is supported only from db9.1")
+@ignore_order(local=True)
+@pytest.mark.parametrize('zero_enabled', [False, True])
+@pytest.mark.parametrize('data_gen', [LongGen()], ids=idfn)
+def test_group_apply_udf_zero_conf(data_gen, zero_enabled):
+    def pandas_add(data):
+        data.sum = data.b + data.a
+        return data
+
+    conf_with_zero = arrow_udf_conf.copy()
+    conf_with_zero.update({
+        'spark.databricks.execution.pandasZeroConfConversion.groupbyApply.enabled': zero_enabled
+    })
+    assert_gpu_and_cpu_are_equal_collect(
+            lambda spark : binary_op_df(spark, data_gen)\
+                    .groupBy('a')\
+                    .applyInPandas(pandas_add, schema="a long, b long"),
+            conf=conf_with_zero)
+
+
+@pytest.mark.skipif(is_databricks91_or_later(), reason="This is tested by other tests from db9.1")
+@ignore_order(local=True)
 @pytest.mark.parametrize('data_gen', [LongGen()], ids=idfn)
 def test_group_apply_udf(data_gen):
     def pandas_add(data):
@@ -230,7 +251,7 @@ def test_group_apply_udf(data_gen):
             conf=arrow_udf_conf)
 
 
-@ignore_order
+@ignore_order(local=True)
 @pytest.mark.parametrize('data_gen', arrow_common_gen, ids=idfn)
 def test_group_apply_udf_more_types(data_gen):
     def group_size_udf(key, pdf):
@@ -252,7 +273,7 @@ def test_map_apply_udf(data_gen):
             yield data[data.b <= data.a]
 
     assert_gpu_and_cpu_are_equal_collect(
-            lambda spark : binary_op_df(spark, data_gen)\
+            lambda spark : binary_op_df(spark, data_gen, num_slices=4)\
                     .mapInPandas(pandas_filter, schema="a long, b long"),
             conf=arrow_udf_conf)
 
@@ -290,7 +311,7 @@ def test_pandas_map_udf_nested_type(data_gen):
             })
 
     assert_gpu_and_cpu_are_equal_collect(
-        lambda spark: unary_op_df(spark, data_gen)\
+        lambda spark: unary_op_df(spark, data_gen, num_slices=4)\
             .mapInPandas(col_types_udf, schema=udf_out_schema),
         conf=arrow_udf_conf)
 

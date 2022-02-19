@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,26 +18,26 @@ package com.nvidia.spark.rapids
 
 import scala.collection.mutable
 
-import ai.rapids.cudf.{GatherMap, NvtxColor}
-import com.nvidia.spark.rapids.RapidsBuffer.SpillCallback
+import ai.rapids.cudf.{GatherMap, NvtxColor, OutOfBoundsPolicy}
 
 import org.apache.spark.TaskContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.Attribute
+import org.apache.spark.sql.catalyst.plans.{InnerLike, JoinType, LeftOuter, RightOuter}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 /**
  * Base class for iterators producing the results of a join.
  * @param gatherNvtxName name to use for the NVTX range when producing the join gather maps
  * @param targetSize configured target batch size in bytes
+ * @param opTime metric to record op time in the iterator
  * @param joinTime metric to record GPU time spent in join
- * @param totalTime metric to record total time in the iterator
  */
 abstract class AbstractGpuJoinIterator(
     gatherNvtxName: String,
     targetSize: Long,
-    joinTime: GpuMetric,
-    totalTime: GpuMetric) extends Iterator[ColumnarBatch] with Arm with AutoCloseable {
+    val opTime: GpuMetric,
+    joinTime: GpuMetric) extends Iterator[ColumnarBatch] with Arm with AutoCloseable {
   private[this] var nextCb: Option[ColumnarBatch] = None
   private[this] var gathererStore: Option[JoinGatherer] = None
 
@@ -50,13 +50,12 @@ abstract class AbstractGpuJoinIterator(
 
   /**
    * Called to setup the next join gatherer instance when the previous instance is done or
-   * there is no previous instance.
-   * @param startNanoTime system nanoseconds timestamp at the top of the iterator loop, useful for
-   *                      calculating the time spent producing the next stream batch
+   * there is no previous instance. Because this is likely to call next or has next on the
+   * stream side all implementations must track their own opTime metrics.
    * @return some gatherer to use next or None if there is no next gatherer or the loop should try
    *         to build the gatherer again (e.g.: to skip a degenerate join result batch)
    */
-  protected def setupNextGatherer(startNanoTime: Long): Option[JoinGatherer]
+  protected def setupNextGatherer(): Option[JoinGatherer]
 
   override def hasNext: Boolean = {
     if (closed) {
@@ -64,23 +63,29 @@ abstract class AbstractGpuJoinIterator(
     }
     var mayContinue = true
     while (nextCb.isEmpty && mayContinue) {
-      val startNanoTime = System.nanoTime()
       if (gathererStore.exists(!_.isDone)) {
-        nextCb = nextCbFromGatherer()
-      } else if (hasNextStreamBatch) {
-        // Need to refill the gatherer
-        gathererStore.foreach(_.close())
-        gathererStore = None
-        gathererStore = setupNextGatherer(startNanoTime)
-        nextCb = nextCbFromGatherer()
+        opTime.ns {
+          nextCb = nextCbFromGatherer()
+        }
       } else {
-        mayContinue = false
+        if (hasNextStreamBatch) {
+          // Need to refill the gatherer
+          opTime.ns {
+            gathererStore.foreach(_.close())
+            gathererStore = None
+          }
+          gathererStore = setupNextGatherer()
+          opTime.ns {
+            nextCb = nextCbFromGatherer()
+          }
+        } else {
+          mayContinue = false
+        }
       }
-      totalTime += (System.nanoTime() - startNanoTime)
     }
     if (nextCb.isEmpty) {
       // Nothing is left to return so close ASAP.
-      close()
+      opTime.ns(close())
     }
     nextCb.isDefined
   }
@@ -133,9 +138,8 @@ abstract class AbstractGpuJoinIterator(
  * @param builtBatch batch for the built side input of the join
  * @param targetSize configured target batch size in bytes
  * @param spillCallback callback to use when spilling
+ * @param opTime metric to record time spent for this operation
  * @param joinTime metric to record GPU time spent in join
- * @param streamTime metric to record time spent producing streaming side batches
- * @param totalTime metric to record total time in the iterator
  */
 abstract class SplittableJoinIterator(
     gatherNvtxName: String,
@@ -144,14 +148,13 @@ abstract class SplittableJoinIterator(
     builtBatch: LazySpillableColumnarBatch,
     targetSize: Long,
     spillCallback: SpillCallback,
-    joinTime: GpuMetric,
-    streamTime: GpuMetric,
-    totalTime: GpuMetric)
+    opTime: GpuMetric,
+    joinTime: GpuMetric)
     extends AbstractGpuJoinIterator(
       gatherNvtxName,
       targetSize,
-      joinTime = joinTime,
-      totalTime = totalTime) with Logging {
+      opTime = opTime,
+      joinTime = joinTime) with Logging {
   // For some join types even if there is no stream data we might output something
   private var isInitialJoin = true
   // If the join explodes this holds batches from the stream side split into smaller pieces.
@@ -172,46 +175,53 @@ abstract class SplittableJoinIterator(
     isInitialJoin || pendingSplits.nonEmpty || stream.hasNext
   }
 
-  override def setupNextGatherer(startNanoTime: Long): Option[JoinGatherer] = {
+  override def setupNextGatherer(): Option[JoinGatherer] = {
     val wasInitialJoin = isInitialJoin
     isInitialJoin = false
     if (pendingSplits.nonEmpty || stream.hasNext) {
       val cb = if (pendingSplits.nonEmpty) {
-        withResource(pendingSplits.dequeue()) {
-          _.getColumnarBatch()
+        opTime.ns {
+          withResource(pendingSplits.dequeue()) {
+            _.getColumnarBatch()
+          }
         }
       } else {
         val batch = withResource(stream.next()) { lazyBatch =>
-          lazyBatch.releaseBatch()
+          opTime.ns {
+            lazyBatch.releaseBatch()
+          }
         }
-        streamTime += (System.nanoTime() - startNanoTime)
         batch
       }
-      withResource(cb) { cb =>
-        val numJoinRows = computeNumJoinRows(cb)
+      opTime.ns {
+        withResource(cb) { cb =>
+          val numJoinRows = computeNumJoinRows(cb)
 
-        // We want the gather maps size to be around the target size. There are two gather maps
-        // that are made up of ints, so compute how many rows on the stream side will produce the
-        // desired gather maps size.
-        val maxJoinRows = Math.max(1, targetSize / (2 * Integer.BYTES))
-        if (numJoinRows > maxJoinRows && cb.numRows() > 1) {
-          // Need to split the batch to reduce the gather maps size. This takes a simplistic
-          // approach of assuming the data is uniformly distributed in the stream table.
-          val numSplits = Math.min(cb.numRows(),
-            Math.ceil(numJoinRows.toDouble / maxJoinRows).toInt)
-          splitAndSave(cb, numSplits)
+          // We want the gather maps size to be around the target size. There are two gather maps
+          // that are made up of ints, so compute how many rows on the stream side will produce the
+          // desired gather maps size.
+          val maxJoinRows = Math.max(1, targetSize / (2 * Integer.BYTES))
+          if (numJoinRows > maxJoinRows && cb.numRows() > 1) {
+            // Need to split the batch to reduce the gather maps size. This takes a simplistic
+            // approach of assuming the data is uniformly distributed in the stream table.
+            val numSplits = Math.min(cb.numRows(),
+              Math.ceil(numJoinRows.toDouble / maxJoinRows).toInt)
+            splitAndSave(cb, numSplits)
 
-          // Return no gatherer so the outer loop will try again
-          return None
+            // Return no gatherer so the outer loop will try again
+            return None
+          }
+
+          createGatherer(cb, Some(numJoinRows))
         }
-
-        createGatherer(cb, Some(numJoinRows))
       }
     } else {
-      assert(wasInitialJoin)
-      import scala.collection.JavaConverters._
-      withResource(GpuColumnVector.emptyBatch(streamAttributes.asJava)) { cb =>
-        createGatherer(cb, None)
+      opTime.ns {
+        assert(wasInitialJoin)
+        import scala.collection.JavaConverters._
+        withResource(GpuColumnVector.emptyBatch(streamAttributes.asJava)) { cb =>
+          createGatherer(cb, None)
+        }
       }
     }
   }
@@ -272,7 +282,8 @@ abstract class SplittableJoinIterator(
   protected def makeGatherer(
       maps: Array[GatherMap],
       leftData: LazySpillableColumnarBatch,
-      rightData: LazySpillableColumnarBatch): Option[JoinGatherer] = {
+      rightData: LazySpillableColumnarBatch,
+      joinType: JoinType): Option[JoinGatherer] = {
     assert(maps.length > 0 && maps.length <= 2)
     try {
       val leftMap = maps.head
@@ -290,11 +301,37 @@ abstract class SplittableJoinIterator(
       val lazyLeftMap = LazySpillableGatherMap(leftMap, spillCallback, "left_map")
       val gatherer = rightMap match {
         case None =>
+          // When there isn't a `rightMap` we are in either LeftSemi or LeftAnti joins.
+          // In these cases, the map and the table are both the left side, and everything in the map
+          // is a match on the left table, so we don't want to check for bounds.
           rightData.close()
-          JoinGatherer(lazyLeftMap, leftData)
+          JoinGatherer(lazyLeftMap, leftData, OutOfBoundsPolicy.DONT_CHECK)
         case Some(right) =>
+          // Inner joins -- manifest the intersection of both left and right sides. The gather maps
+          //   contain the number of rows that must be manifested, and every index
+          //   must be within bounds, so we can skip the bounds checking.
+          //
+          // Left outer  -- Left outer manifests all rows for the left table. The left gather map
+          //   must contain valid indices, so we skip the check for the left side. The right side
+          //   has to be checked, since we need to produce nulls (for the right) for those
+          //   rows on the left side that don't have a match on the right.
+          //
+          // Right outer -- Is the opposite from left outer (skip right bounds check, keep left)
+          //
+          // Full outer  -- Can produce nulls for any left or right rows that don't have a match
+          //   in the opposite table. So we must check both gather maps.
+          //
+          val leftOutOfBoundsPolicy = joinType match {
+            case _: InnerLike | LeftOuter => OutOfBoundsPolicy.DONT_CHECK
+            case _ => OutOfBoundsPolicy.NULLIFY
+          }
+          val rightOutOfBoundsPolicy = joinType match {
+            case _: InnerLike | RightOuter => OutOfBoundsPolicy.DONT_CHECK
+            case _ => OutOfBoundsPolicy.NULLIFY
+          }
           val lazyRightMap = LazySpillableGatherMap(right, spillCallback, "right_map")
-          JoinGatherer(lazyLeftMap, leftData, lazyRightMap, rightData)
+          JoinGatherer(lazyLeftMap, leftData, lazyRightMap, rightData,
+            leftOutOfBoundsPolicy, rightOutOfBoundsPolicy)
       }
       if (gatherer.isDone) {
         // Nothing matched...

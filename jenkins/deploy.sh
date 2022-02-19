@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Copyright (c) 2020-2021, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2020-2022, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,12 +28,15 @@
 #   SERVER_ID:      The repository id for this deployment.
 #   SERVER_URL:     The url where to deploy artifacts.
 #   GPG_PASSPHRASE: The passphrase used to sign files, only required when <SIGN_FILE> is true.
+#   FINAL_AGG_VERSION_TOBUILD: The spark version of the final build and aggregation.
 ###
 
 set -ex
 SIGN_FILE=$1
 DATABRICKS=$2
 VERSIONS_BUILT=$3
+
+export M2DIR=${M2DIR:-"$WORKSPACE/.m2"}
 
 ###### Build the path of jar(s) to be deployed ######
 
@@ -52,17 +55,18 @@ ART_ID=`mvn help:evaluate -q -pl $DIST_PL -Dexpression=project.artifactId -Dforc
 ART_VER=`mvn help:evaluate -q -pl $DIST_PL -Dexpression=project.version -DforceStdout`
 
 FPATH="$DIST_PL/target/$ART_ID-$ART_VER"
+POM_FPATH="$DIST_PL/target/extra-resources/META-INF/maven/com.nvidia/$ART_ID/pom.xml"
 
 echo "Plan to deploy ${FPATH}.jar to $SERVER_URL (ID:$SERVER_ID)"
 
-
+FINAL_AGG_VERSION_TOBUILD=${FINAL_AGG_VERSION_TOBUILD:-'301'}
 ###### Choose the deploy command ######
 
 if [ "$SIGN_FILE" == true ]; then
     # No javadoc and sources jar is generated for shade artifact only. Use 'sql-plugin' instead
     SQL_ART_ID=`mvn help:evaluate -q -pl $SQL_PL -Dexpression=project.artifactId -DforceStdout`
     SQL_ART_VER=`mvn help:evaluate -q -pl $SQL_PL -Dexpression=project.version -DforceStdout`
-    JS_FPATH="${SQL_PL}/target/${SQL_ART_ID}-${SQL_ART_VER}"
+    JS_FPATH="${SQL_PL}/target/spark${FINAL_AGG_VERSION_TOBUILD}/${SQL_ART_ID}-${SQL_ART_VER}"
     SRC_DOC_JARS="-Dsources=${JS_FPATH}-sources.jar -Djavadoc=${JS_FPATH}-javadoc.jar"
     DEPLOY_CMD="mvn -B gpg:sign-and-deploy-file -s jenkins/settings.xml -Dgpg.passphrase=$GPG_PASSPHRASE"
 else
@@ -82,27 +86,8 @@ $DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
 # Distribution jar is a shaded artifact so use the reduced dependency pom.
 $DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
             $SRC_DOC_JARS \
-            -Dfile=$FPATH.jar -DgroupId=com.nvidia -DartifactId=$ART_ID -Dversion=$ART_VER -DpomFile=./dist/pom.xml
-
-###### Deploy integration tests jar(s) ######
-TESTS_ART_ID=`mvn help:evaluate -q -pl $TESTS_PL -Dexpression=project.artifactId -DforceStdout`
-TESTS_ART_VER=`mvn help:evaluate -q -pl $TESTS_PL -Dexpression=project.version -DforceStdout`
-TESTS_DOC_JARS="-Dsources=deployjars/$TESTS_ART_ID-$TESTS_ART_VER-sources.jar -Djavadoc=deployjars/$TESTS_ART_ID-$TESTS_ART_VER-javadoc.jar"
-# Deploy default integration tests jar (spark301)
-TESTS_FPATH="deployjars/$TESTS_ART_ID-$TESTS_ART_VER"
-cp $TESTS_FPATH-spark301.jar $TESTS_FPATH.jar
-$DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
-        $TESTS_DOC_JARS \
-        -Dfile=$TESTS_FPATH.jar -DpomFile=${TESTS_PL}/pom.xml
-
-# Deploy integration tests jars with classifier 'spark301/spark302/...'
-VERSIONS_LIST=${VERSIONS_BUILT//','/' '}
-for VER in ${VERSIONS_LIST}; do
-    TESTS_FPATH="deployjars/$TESTS_ART_ID-$TESTS_ART_VER-spark$VER"
-    $DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
-            $TESTS_DOC_JARS \
-            -Dfile=$TESTS_FPATH.jar -DpomFile=${TESTS_PL}/pom.xml -Dclassifier=spark$VER
-done
+            -Dfile=$FPATH.jar -DgroupId=com.nvidia -DartifactId=$ART_ID -Dversion=$ART_VER \
+            -DpomFile="$POM_FPATH"
 
 ###### Deploy profiling tool jar(s) ######
 TOOL_PL=${TOOL_PL:-"tools"}
@@ -113,3 +98,21 @@ TOOL_DOC_JARS="-Dsources=${TOOL_FPATH}-sources.jar -Djavadoc=${TOOL_FPATH}-javad
 $DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
             $TOOL_DOC_JARS \
             -Dfile=$TOOL_FPATH.jar -DpomFile=${TOOL_PL}/pom.xml
+
+###### Deploy Spark 2.x explain meta jar ######
+SPARK2_PL=${SPARK2_PL:-"spark2-sql-plugin"}
+SPARK2_ART_ID=`mvn help:evaluate -q -pl $SPARK2_PL -Dexpression=project.artifactId -DforceStdout -Dbuildver=24X`
+SPARK2_ART_VER=`mvn help:evaluate -q -pl $SPARK2_PL -Dexpression=project.version -DforceStdout -Dbuildver=24X`
+SPARK2_FPATH="$M2DIR/com/nvidia/$SPARK2_ART_ID/$SPARK2_ART_VER/$SPARK2_ART_ID-$SPARK2_ART_VER"
+SPARK2_DOC_JARS="-Dsources=${SPARK2_FPATH}-sources.jar -Djavadoc=${SPARK2_FPATH}-javadoc.jar"
+# a bit ugly but just hardcode to spark24 for now since only version supported
+SPARK2_CLASSIFIER='spark24'
+SPARK2_CLASSIFIER_JAR="${SPARK2_FPATH}-${SPARK2_CLASSIFIER}.jar"
+# Oss requires a main jar file along with classifier jars
+cp ${SPARK2_FPATH}-${SPARK2_CLASSIFIER}.jar ${SPARK2_FPATH}.jar
+$DEPLOY_CMD -Durl=$SERVER_URL -DrepositoryId=$SERVER_ID \
+            $SPARK2_DOC_JARS \
+            -Dfile=${SPARK2_FPATH}.jar -DpomFile=${SPARK2_PL}/pom.xml \
+            -Dfiles=$SPARK2_CLASSIFIER_JAR \
+            -Dtypes=jar \
+            -Dclassifiers=$SPARK2_CLASSIFIER

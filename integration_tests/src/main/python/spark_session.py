@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2021, NVIDIA CORPORATION.
+# Copyright (c) 2020-2022, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -100,12 +100,17 @@ def with_gpu_session(func, conf={}):
         copy['spark.rapids.sql.test.allowedNonGpu'] = ','.join(get_non_gpu_allowed())
 
     copy['spark.rapids.sql.test.validateExecsInGpuPlan'] = ','.join(get_validate_execs_in_gpu_plan())
-    # TODO: remove when decimal types can be enabled by default
-    copy['spark.rapids.sql.decimalType.enabled'] = 'true'
     return with_spark_session(func, conf=copy)
 
 def is_before_spark_311():
-    return spark_version() < "3.1.1"
+    return spark_version() < "3.1.0"
 
 def is_before_spark_320():
     return spark_version() < "3.2.0"
+
+def is_before_spark_330():
+    return spark_version() < "3.3.0"
+
+def is_databricks91_or_later():
+    spark = get_spark_i_know_what_i_am_doing()
+    return spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion", "") >= "9.1"

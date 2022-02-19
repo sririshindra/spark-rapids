@@ -85,9 +85,9 @@ If you'd like to further accelerate init time to 4-5 minutes, create a custom Da
 ## Run PySpark or Scala Notebook on a Dataproc Cluster Accelerated by GPUs
 To use notebooks with a Dataproc cluster, click on the cluster name under the Dataproc cluster tab
 and navigate to the "Web Interfaces" tab.  Under "Web Interfaces", click on the JupyterLab or
-Jupyter link to start to use sample [Mortgage ETL on GPU Jupyter
-Notebook](../demo/GCP/Mortgage-ETL-GPU.ipynb) to process full 17 years [Mortgage
-data](https://rapidsai.github.io/demos/datasets/mortgage-data).
+Jupyter link to start to use sample 
+[Mortgage ETL on GPU Jupyter Notebook](../demo/GCP/Mortgage-ETL-GPU.ipynb) to process full 17 years 
+[Mortgage data](https://docs.rapids.ai/datasets/mortgage-data).
 
 ![Dataproc Web Interfaces](../img/GCP/dataproc-service.png)
 
@@ -206,8 +206,8 @@ cd custom-images
 export CUSTOMIZATION_SCRIPT=/path/to/gpu_dataproc_packages_ubuntu_sample.sh
 export ZONE=[Your Preferred GCP Zone]
 export GCS_BUCKET=[Your GCS Bucket]
-export IMAGE_NAME=a209-ubuntu18-gpu-t4
-export DATAPROC_VERSION=2.0.9-ubuntu18
+export IMAGE_NAME=sample-2027-ubuntu18-gpu-t4
+export DATAPROC_VERSION=2.0.27-ubuntu18
 export GPU_NAME=nvidia-tesla-t4
 export GPU_COUNT=1
 
@@ -251,7 +251,7 @@ export NUM_WORKERS=2
 
 gcloud dataproc clusters create $CLUSTER_NAME  \
     --region $REGION \
-    --image=sample-209-ubuntu18-gpu-t4 \
+    --image=sample-2027-ubuntu18-gpu-t4 \
     --master-machine-type n1-standard-4 \
     --num-workers $NUM_WORKERS \
     --worker-accelerator type=nvidia-tesla-t4,count=$NUM_GPUS \

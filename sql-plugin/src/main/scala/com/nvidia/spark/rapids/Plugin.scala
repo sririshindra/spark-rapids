@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 package com.nvidia.spark.rapids
 
+import java.time.ZoneId
 import java.util.Properties
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 
@@ -33,6 +34,7 @@ import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.sql.rapids.GpuShuffleEnv
 import org.apache.spark.sql.util.QueryExecutionListener
@@ -70,8 +72,21 @@ object RapidsPluginUtils extends Logging {
     logInfo(s"cudf build: $cudfProps")
     val pluginVersion = pluginProps.getProperty("version", "UNKNOWN")
     val cudfVersion = cudfProps.getProperty("version", "UNKNOWN")
-    logWarning(s"RAPIDS Accelerator $pluginVersion using cudf $cudfVersion." +
-        s" To disable GPU support set `${RapidsConf.SQL_ENABLED}` to false")
+    logWarning(s"RAPIDS Accelerator $pluginVersion using cudf $cudfVersion.")
+  }
+
+  def logPluginMode(conf: RapidsConf): Unit = {
+    if (conf.isSqlEnabled && conf.isSqlExecuteOnGPU) {
+      logWarning("RAPIDS Accelerator is enabled, to disable GPU " +
+        s"support set `${RapidsConf.SQL_ENABLED}` to false.")
+    } else if (conf.isSqlEnabled && conf.isSqlExplainOnlyEnabled) {
+      logWarning("RAPIDS Accelerator is in explain only mode, to disable " +
+        s"set `${RapidsConf.SQL_ENABLED}` to false. To change the mode, " +
+        s"restart the application and change `${RapidsConf.SQL_MODE}`.")
+    } else {
+      logWarning("RAPIDS Accelerator is disabled, to enable GPU " +
+        s"support set `${RapidsConf.SQL_ENABLED}` to true.")
+    }
   }
 
   def fixupConfigs(conf: SparkConf): Unit = {
@@ -109,6 +124,8 @@ object RapidsPluginUtils extends Logging {
           s"the RAPIDS Accelerator. Please disable the RAPIDS Accelerator or use a supported " +
           s"serializer ($JAVA_SERIALIZER_NAME, $KRYO_SERIALIZER_NAME).")
     }
+    // set driver timezone
+    conf.set(RapidsConf.DRIVER_TIMEZONE.key, ZoneId.systemDefault().normalized().toString)
   }
 
   def loadProps(resourceName: String): Properties = {
@@ -148,8 +165,9 @@ class RapidsDriverPlugin extends DriverPlugin with Logging {
     val sparkConf = pluginContext.conf
     RapidsPluginUtils.fixupConfigs(sparkConf)
     val conf = new RapidsConf(sparkConf)
+    RapidsPluginUtils.logPluginMode(conf)
 
-    if (GpuShuffleEnv.isRapidsShuffleAvailable) {
+    if (GpuShuffleEnv.isRapidsShuffleAvailable(conf)) {
       GpuShuffleEnv.initShuffleManager()
       if (conf.shuffleTransportEarlyStart) {
         rapidsShuffleHeartbeatManager =
@@ -179,12 +197,27 @@ class RapidsExecutorPlugin extends ExecutorPlugin with Logging {
       // by setting this config spark.rapids.cudfVersionOverride=true
       checkCudfVersion(conf)
 
+      // Validate driver and executor time zone are same if the driver time zone is supported by
+      // the plugin.
+      val driverTimezone = conf.driverTimeZone match {
+        case Some(value) => ZoneId.of(value)
+        case None => throw new RuntimeException(s"Driver time zone cannot be determined.")
+      }
+      if (TypeChecks.areTimestampsSupported(driverTimezone)) {
+        val executorTimezone = ZoneId.systemDefault()
+        if (executorTimezone.normalized() != driverTimezone.normalized()) {
+          throw new RuntimeException(s" Driver and executor timezone mismatch. " +
+              s"Driver timezone is $driverTimezone and executor timezone is " +
+              s"$executorTimezone. Set executor timezone to $driverTimezone.")
+        }
+      }
+
       // we rely on the Rapids Plugin being run with 1 GPU per executor so we can initialize
       // on executor startup.
       if (!GpuDeviceManager.rmmTaskInitEnabled) {
         logInfo("Initializing memory from Executor Plugin")
-        GpuDeviceManager.initializeGpuAndMemory(pluginContext.resources().asScala.toMap)
-        if (GpuShuffleEnv.isRapidsShuffleAvailable) {
+        GpuDeviceManager.initializeGpuAndMemory(pluginContext.resources().asScala.toMap, conf)
+        if (GpuShuffleEnv.isRapidsShuffleAvailable(conf)) {
           GpuShuffleEnv.initShuffleManager()
           if (conf.shuffleTransportEarlyStart) {
             logInfo("Initializing shuffle manager heartbeats")
@@ -325,9 +358,8 @@ object ExecutionPlanCaptureCallback {
   }
 
   def assertContains(gpuPlan: SparkPlan, className: String): Unit = {
-    val executedPlan = ExecutionPlanCaptureCallback.extractExecutedPlan(Some(gpuPlan))
-    assert(containsPlan(executedPlan, className),
-      s"Could not find $className in the Spark plan\n$executedPlan")
+    assert(containsPlan(gpuPlan, className),
+      s"Could not find $className in the Spark plan\n$gpuPlan")
   }
 
   def assertContains(df: DataFrame, gpuClass: String): Unit = {
@@ -336,9 +368,8 @@ object ExecutionPlanCaptureCallback {
   }
 
   def assertNotContain(gpuPlan: SparkPlan, className: String): Unit = {
-    val executedPlan = ExecutionPlanCaptureCallback.extractExecutedPlan(Some(gpuPlan))
-    assert(!containsPlan(executedPlan, className),
-      s"We found $className in the Spark plan\n$executedPlan")
+    assert(!containsPlan(gpuPlan, className),
+      s"We found $className in the Spark plan\n$gpuPlan")
   }
 
   def assertNotContain(df: DataFrame, gpuClass: String): Unit = {
@@ -360,20 +391,26 @@ object ExecutionPlanCaptureCallback {
     executedPlan.expressions.exists(didFallBack(_, fallbackCpuClass))
   }
 
-  private def containsExpression(exp: Expression, className: String): Boolean = {
-    PlanUtils.getBaseNameFromClass(exp.getClass.getName) == className ||
-        exp.children.exists(containsExpression(_, className))
-  }
+  private def containsExpression(exp: Expression, className: String): Boolean = exp.find {
+    case e if PlanUtils.getBaseNameFromClass(e.getClass.getName) == className => true
+    case e: ExecSubqueryExpression => containsPlan(e.plan, className)
+    case _ => false
+  }.nonEmpty
 
-  private def containsPlan(plan: SparkPlan, className: String): Boolean = {
-    val p = ExecutionPlanCaptureCallback.extractExecutedPlan(Some(plan)) match {
-      case p: QueryStageExec => p.plan
-      case p => p
-    }
-    PlanUtils.sameClass(p, className) ||
-        p.expressions.exists(containsExpression(_, className)) ||
-        p.children.exists(containsPlan(_, className))
-  }
+  private def containsPlan(plan: SparkPlan, className: String): Boolean = plan.find {
+    case p if PlanUtils.sameClass(p, className) =>
+      true
+    case p: AdaptiveSparkPlanExec =>
+      containsPlan(p.executedPlan, className)
+    case p: QueryStageExec =>
+      containsPlan(p.plan, className)
+    case p: ReusedSubqueryExec =>
+      containsPlan(p.child, className)
+    case p: ReusedExchangeExec =>
+      containsPlan(p.child, className)
+    case p =>
+      p.expressions.exists(containsExpression(_, className))
+  }.nonEmpty
 }
 
 /**

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,9 +51,7 @@ object GpuMetric extends Logging {
   val NUM_OUTPUT_BATCHES = "numOutputBatches"
   val PARTITION_SIZE = "partitionSize"
   val NUM_PARTITIONS = "numPartitions"
-  val TOTAL_TIME = "totalTime"
   val OP_TIME = "opTime"
-  val GPU_OP_TIME = "gpuOpTime"
   val SEMAPHORE_WAIT_TIME = "semaphoreWaitTime"
   val PEAK_DEVICE_MEMORY = "peakDevMemory"
   val COLLECT_TIME = "collectTime"
@@ -70,6 +68,8 @@ object GpuMetric extends Logging {
   val SPILL_AMOUNT_DISK = "spillDisk"
   val SPILL_AMOUNT_HOST = "spillHost"
   val NUM_TASKS_FALL_BACKED = "numTasksFallBacked"
+  val READ_FS_TIME = "readFsTime"
+  val WRITE_BUFFER_TIME = "writeBufferTime"
 
   // Metric Descriptions.
   val DESCRIPTION_BUFFER_TIME = "buffer time"
@@ -80,9 +80,7 @@ object GpuMetric extends Logging {
   val DESCRIPTION_NUM_OUTPUT_BATCHES = "output columnar batches"
   val DESCRIPTION_PARTITION_SIZE = "partition data size"
   val DESCRIPTION_NUM_PARTITIONS = "partitions"
-  val DESCRIPTION_TOTAL_TIME = "total time"
   val DESCRIPTION_OP_TIME = "op time"
-  val DESCRIPTION_GPU_OP_TIME = "GPU op time"
   val DESCRIPTION_SEMAPHORE_WAIT_TIME = "GPU semaphore wait time"
   val DESCRIPTION_PEAK_DEVICE_MEMORY = "peak device memory"
   val DESCRIPTION_COLLECT_TIME = "collect batch time"
@@ -99,6 +97,8 @@ object GpuMetric extends Logging {
   val DESCRIPTION_SPILL_AMOUNT_DISK = "bytes spilled to disk"
   val DESCRIPTION_SPILL_AMOUNT_HOST = "bytes spilled to host"
   val DESCRIPTION_NUM_TASKS_FALL_BACKED = "number of sort fallback tasks"
+  val DESCRIPTION_READ_FS_TIME = "time to read fs data"
+  val DESCRIPTION_WRITE_BUFFER_TIME = "time to write data to buffer"
 
   def unwrap(input: GpuMetric): SQLMetric = input match {
     case w :WrappedGpuMetric => w.sqlMetric
@@ -124,26 +124,30 @@ object GpuMetric extends Logging {
   object MODERATE_LEVEL extends MetricsLevel(1)
   object ESSENTIAL_LEVEL extends MetricsLevel(2)
 
-  def makeSpillCallback(allMetrics: Map[String, GpuMetric]): RapidsBuffer.SpillCallback = {
+  def makeSpillCallback(allMetrics: Map[String, GpuMetric]): SpillCallback = {
     val spillAmount = allMetrics(SPILL_AMOUNT)
     val disk = allMetrics(SPILL_AMOUNT_DISK)
     val host = allMetrics(SPILL_AMOUNT_HOST)
-    def updateMetrics(from: StorageTier, to: StorageTier, amount: Long): Unit = {
-      from match {
-        case DEVICE =>
-          spillAmount += amount
-        case _ => // ignored
+    val sem = allMetrics(SEMAPHORE_WAIT_TIME)
+    new SpillCallback {
+      override def apply(from: StorageTier, to: StorageTier, amount: Long): Unit = {
+        from match {
+          case DEVICE =>
+            spillAmount += amount
+          case _ => // ignored
+        }
+        to match {
+          case HOST =>
+            host += amount
+          case GDS | DISK =>
+            disk += amount
+          case _ =>
+            logWarning(s"Spill to $to is unsupported in metrics: $amount")
+        }
       }
-      to match {
-        case HOST =>
-          host += amount
-        case GDS | DISK =>
-          disk += amount
-        case _ =>
-          logWarning(s"Spill to $to is unsupported in metrics: $amount")
-      }
+
+      override def semaphoreWaitTime: GpuMetric = sem
     }
-    updateMetrics
   }
 }
 
@@ -152,6 +156,15 @@ sealed abstract class GpuMetric extends Serializable {
   def set(v: Long): Unit
   def +=(v: Long): Unit
   def add(v: Long): Unit
+
+  def ns[T](f: => T): T = {
+    val start = System.nanoTime()
+    try {
+      f
+    } finally {
+      add(System.nanoTime() - start)
+    }
+  }
 }
 
 object NoopMetric extends GpuMetric {
@@ -270,8 +283,12 @@ trait GpuExec extends SparkPlan with Arm {
 
   protected def spillMetrics: Map[String, GpuMetric] = Map(
     SPILL_AMOUNT -> createSizeMetric(ESSENTIAL_LEVEL, DESCRIPTION_SPILL_AMOUNT),
-    SPILL_AMOUNT_DISK -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_SPILL_AMOUNT_DISK),
-    SPILL_AMOUNT_HOST -> createSizeMetric(MODERATE_LEVEL, DESCRIPTION_SPILL_AMOUNT_HOST)
+    SPILL_AMOUNT_DISK -> createSizeMetric(DEBUG_LEVEL, DESCRIPTION_SPILL_AMOUNT_DISK),
+    SPILL_AMOUNT_HOST -> createSizeMetric(DEBUG_LEVEL, DESCRIPTION_SPILL_AMOUNT_HOST)
+  ) ++ semaphoreMetrics
+
+  protected def semaphoreMetrics: Map[String, GpuMetric] = Map(
+    SEMAPHORE_WAIT_TIME -> createNanoTimingMetric(DEBUG_LEVEL, DESCRIPTION_SEMAPHORE_WAIT_TIME)
   )
 
   /**

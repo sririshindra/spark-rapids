@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeReference, Expression, GenericInternalRow, SpecializedGetters, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.GenerateUnsafeProjection
 import org.apache.spark.sql.catalyst.util.{ArrayBasedMapData, ArrayData, GenericArrayData, MapData}
-import org.apache.spark.sql.columnar.{CachedBatch, CachedBatchSerializer}
+import org.apache.spark.sql.columnar.CachedBatch
 import org.apache.spark.sql.execution.datasources.parquet.{ParquetReadSupport, ParquetToSparkSchemaConverter, ParquetWriteSupport, SparkToParquetSchemaConverter, VectorizedColumnReader}
 import org.apache.spark.sql.execution.datasources.parquet.rapids.shims.v2.{ParquetRecordMaterializer, ShimVectorizedColumnReader}
 import org.apache.spark.sql.execution.vectorized.{OffHeapColumnVector, WritableColumnVector}
@@ -284,9 +284,9 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
 
   def isSupportedByCudf(dataType: DataType): Boolean = {
     dataType match {
-      // TODO: when arrays are supported for cudf writes add it here.
-      // https://github.com/NVIDIA/spark-rapids/issues/2054
+      case a: ArrayType => isSupportedByCudf(a.elementType)
       case s: StructType => s.forall(field => isSupportedByCudf(field.dataType))
+      case m: MapType => isSupportedByCudf(m.keyType) && isSupportedByCudf(m.valueType)
       case _ => GpuColumnVector.isNonNestedSupportedType(dataType)
     }
   }
@@ -328,7 +328,8 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
     val bytesAllowedPerBatch = getBytesAllowedPerBatch(conf)
     val (schemaWithUnambiguousNames, _) = getSupportedSchemaFromUnsupported(schema)
     val structSchema = schemaWithUnambiguousNames.toStructType
-    if (rapidsConf.isSqlEnabled && isSchemaSupportedByCudf(schema)) {
+    if (rapidsConf.isSqlEnabled && rapidsConf.isSqlExecuteOnGPU &&
+        isSchemaSupportedByCudf(schema)) {
       def putOnGpuIfNeeded(batch: ColumnarBatch): ColumnarBatch = {
         if (!batch.column(0).isInstanceOf[GpuColumnVector]) {
           val s: StructType = structSchema
@@ -436,8 +437,8 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
       table: Table,
       schema: StructType): ParquetBufferConsumer = {
     val buffer = new ParquetBufferConsumer(table.getRowCount.toInt)
-    val opts = GpuParquetFileFormat
-        .parquetWriterOptionsFromSchema(ParquetWriterOptions.builder(), schema, writeInt96 = false)
+    val opts = SchemaUtils
+        .writerOptionsFromSchema(ParquetWriterOptions.builder(), schema, writeInt96 = false)
         .withStatisticsFrequency(StatisticsFrequency.ROWGROUP).build()
     withResource(Table.writeParquetChunked(opts, buffer)) { writer =>
       writer.write(table)
@@ -553,7 +554,7 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
     val rapidsConf = new RapidsConf(conf)
     val (cachedSchemaWithNames, selectedSchemaWithNames) =
       getSupportedSchemaFromUnsupported(cacheAttributes, newSelectedAttributes)
-    if (rapidsConf.isSqlEnabled &&
+    if (rapidsConf.isSqlEnabled && rapidsConf.isSqlExecuteOnGPU &&
         isSchemaSupportedByCudf(cachedSchemaWithNames)) {
       val batches = convertCachedBatchToColumnarInternal(input, cachedSchemaWithNames,
         selectedSchemaWithNames, newSelectedAttributes)
@@ -565,11 +566,14 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
       })
       cbRdd.mapPartitions(iter => CloseableColumnBatchIterator(iter))
     } else {
+      val origSelectedAttributesWithUnambiguousNames = 
+        sanitizeColumnNames(newSelectedAttributes, selectedSchemaWithNames)
       val broadcastedConf = SparkSession.active.sparkContext.broadcast(conf.getAllConfs)
       input.mapPartitions {
         cbIter => {
           new CachedBatchIteratorConsumer(cbIter, cachedSchemaWithNames, selectedSchemaWithNames,
-            cacheAttributes, newSelectedAttributes, broadcastedConf).getColumnBatchIterator
+            cacheAttributes, origSelectedAttributesWithUnambiguousNames, broadcastedConf)
+            .getColumnBatchIterator
         }
       }
     }
@@ -592,11 +596,12 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
       conf: SQLConf): RDD[InternalRow] = {
     val (cachedSchemaWithNames, selectedSchemaWithNames) =
       getSupportedSchemaFromUnsupported(cacheAttributes, selectedAttributes)
+    val newSelectedAttributes = sanitizeColumnNames(selectedAttributes, selectedSchemaWithNames)
     val broadcastedConf = SparkSession.active.sparkContext.broadcast(conf.getAllConfs)
     input.mapPartitions {
       cbIter => {
         new CachedBatchIteratorConsumer(cbIter, cachedSchemaWithNames, selectedSchemaWithNames,
-          cacheAttributes, selectedAttributes, broadcastedConf).getInternalRowIterator
+          cacheAttributes, newSelectedAttributes, broadcastedConf).getInternalRowIterator
       }
     }
   }
@@ -1357,6 +1362,14 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
     }
   }
 
+  // We want to change the original schema to have the new names as well
+  private def sanitizeColumnNames(originalSchema: Seq[Attribute],
+      schemaToCopyNamesFrom: Seq[Attribute]): Seq[Attribute] = {
+    originalSchema.zip(schemaToCopyNamesFrom).map {
+      case (origAttribute, newAttribute) => origAttribute.withName(newAttribute.name)
+    }
+  }
+
   private def getSupportedSchemaFromUnsupported(
       cachedAttributes: Seq[Attribute],
       requestedAttributes: Seq[Attribute] = Seq.empty): (Seq[Attribute], Seq[Attribute]) = {
@@ -1442,7 +1455,8 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
     val rapidsConf = new RapidsConf(conf)
     val bytesAllowedPerBatch = getBytesAllowedPerBatch(conf)
     val (schemaWithUnambiguousNames, _) = getSupportedSchemaFromUnsupported(schema)
-    if (rapidsConf.isSqlEnabled && isSchemaSupportedByCudf(schema)) {
+    if (rapidsConf.isSqlEnabled && rapidsConf.isSqlExecuteOnGPU &&
+        isSchemaSupportedByCudf(schema)) {
       val structSchema = schemaWithUnambiguousNames.toStructType
       val converters = new GpuRowToColumnConverter(structSchema)
       val columnarBatchRdd = input.mapPartitions(iter => {
@@ -1475,6 +1489,9 @@ class ParquetCachedBatchSerializer extends GpuCachedBatchSerializer with Arm {
  */
 private[rapids] class ParquetOutputFileFormat {
 
+  @scala.annotation.nowarn(
+    "msg=constructor .* in class .* is deprecated"
+  )
   def getRecordWriter(output: OutputFile, conf: Configuration): RecordWriter[Void, InternalRow] = {
     import ParquetOutputFormat._
 

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ class AcceleratedColumnarToRowIterator(
     numInputBatches: GpuMetric,
     numOutputRows: GpuMetric,
     opTime: GpuMetric,
-    fetchTime: GpuMetric) extends Iterator[InternalRow] with Arm with Serializable {
+    streamTime: GpuMetric) extends Iterator[InternalRow] with Arm with Serializable {
   @transient private var pendingCvs: Queue[HostColumnVector] = Queue.empty
   // GPU batches read in must be closed by the receiver (us)
   @transient private var currentCv: Option[HostColumnVector] = None
@@ -108,7 +108,17 @@ class AcceleratedColumnarToRowIterator(
     if (cb.numRows() > 0) {
       withResource(new NvtxWithMetrics("ColumnarToRow: batch", NvtxColor.RED, opTime)) { _ =>
         withResource(rearrangeRows(cb)) { table =>
-          withResource(table.convertToRows()) { rowsCvList =>
+          // The fixed-width optimized cudf kernel only supports up to 1.5 KB per row which means at
+          // most 184 double/long values. Spark by default limits codegen to 100 fields
+          // "spark.sql.codegen.maxFields". So, we are going to be cautious and start with that
+          // until we have tested it more. We branching over the size of the output to know which
+          // kernel to call. If schema.length < 100 we call the fixed-width optimized version,
+          // otherwise the generic one
+          withResource(if (schema.length < 100) {
+            table.convertToRowsFixedWidthOptimized()
+          } else {
+            table.convertToRows()
+          }) { rowsCvList =>
             rowsCvList.foreach { rowsCv =>
               pendingCvs += rowsCv.copyToHost()
             }
@@ -143,7 +153,7 @@ class AcceleratedColumnarToRowIterator(
   }
 
   private def fetchNextBatch(): Option[ColumnarBatch] = {
-    withResource(new NvtxWithMetrics("ColumnarToRow: fetch", NvtxColor.BLUE, fetchTime)) { _ =>
+    withResource(new NvtxWithMetrics("ColumnarToRow: fetch", NvtxColor.BLUE, streamTime)) { _ =>
       if (batches.hasNext) {
         Some(batches.next())
       } else {
@@ -179,10 +189,17 @@ class ColumnarToRowIterator(batches: Iterator[ColumnarBatch],
     numInputBatches: GpuMetric,
     numOutputRows: GpuMetric,
     opTime: GpuMetric,
-    fetchTime: GpuMetric) extends Iterator[InternalRow] with Arm {
+    streamTime: GpuMetric,
+    nullSafe: Boolean = false) extends Iterator[InternalRow] with Arm {
   // GPU batches read in must be closed by the receiver (us)
   @transient private var cb: ColumnarBatch = null
   private var it: java.util.Iterator[InternalRow] = null
+
+  private[this] lazy val toHost = if (nullSafe) {
+    (gpuCV: GpuColumnVector) => gpuCV.copyToNullSafeHost()
+  } else{
+    (gpuCV: GpuColumnVector) => gpuCV.copyToHost()
+  }
 
   Option(TaskContext.get()).foreach(_.addTaskCompletionListener[Unit](_ => closeCurrentBatch()))
 
@@ -201,7 +218,7 @@ class ColumnarToRowIterator(batches: Iterator[ColumnarBatch],
     devCb.foreach { devCb =>
       withResource(new NvtxWithMetrics("ColumnarToRow: batch", NvtxColor.RED, opTime)) { _ =>
         try {
-          cb = new ColumnarBatch(GpuColumnVector.extractColumns(devCb).map(_.copyToHost()),
+          cb = new ColumnarBatch(GpuColumnVector.extractColumns(devCb).map(toHost),
             devCb.numRows())
           it = cb.rowIterator()
           // In order to match the numOutputRows metric in the generated code we update
@@ -219,7 +236,7 @@ class ColumnarToRowIterator(batches: Iterator[ColumnarBatch],
   }
 
   private def fetchNextBatch(): Option[ColumnarBatch] = {
-    withResource(new NvtxWithMetrics("ColumnarToRow: fetch", NvtxColor.BLUE, fetchTime)) { _ =>
+    withResource(new NvtxWithMetrics("ColumnarToRow: fetch", NvtxColor.BLUE, streamTime)) { _ =>
       while (batches.hasNext) {
         numInputBatches += 1
         val devCb = batches.next()
@@ -258,7 +275,8 @@ object CudfRowTransitions {
   def isSupportedType(dataType: DataType): Boolean = dataType match {
     // Only fixed width for now...
     case ByteType | ShortType | IntegerType | LongType |
-         FloatType | DoubleType | BooleanType | DateType | TimestampType | _: DecimalType => true
+         FloatType | DoubleType | BooleanType | DateType | TimestampType => true
+    case dt: DecimalType if dt.precision <= Decimal.MAX_LONG_DIGITS => true
     case _ => false
   }
 
@@ -287,16 +305,16 @@ abstract class GpuColumnarToRowExecParent(child: SparkPlan,
   override lazy val allMetrics: Map[String, GpuMetric] = Map(
     NUM_OUTPUT_ROWS -> createMetric(outputRowsLevel, DESCRIPTION_NUM_OUTPUT_ROWS),
     OP_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_OP_TIME),
-    COLLECT_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_COLLECT_TIME),
+    STREAM_TIME -> createNanoTimingMetric(MODERATE_LEVEL, DESCRIPTION_STREAM_TIME),
     NUM_INPUT_BATCHES -> createMetric(DEBUG_LEVEL, DESCRIPTION_NUM_INPUT_BATCHES))
 
   override def doExecute(): RDD[InternalRow] = {
     val numOutputRows = gpuLongMetric(NUM_OUTPUT_ROWS)
     val numInputBatches = gpuLongMetric(NUM_INPUT_BATCHES)
     val opTime = gpuLongMetric(OP_TIME)
-    val collectTime = gpuLongMetric(COLLECT_TIME)
+    val streamTime = gpuLongMetric(STREAM_TIME)
 
-    val f = makeIteratorFunc(child.output, numOutputRows, numInputBatches, opTime, collectTime)
+    val f = makeIteratorFunc(child.output, numOutputRows, numInputBatches, opTime, streamTime)
 
     val cdata = child.executeColumnar()
     val rdata = if (exportColumnarRdd) {
@@ -330,26 +348,27 @@ object GpuColumnarToRowExecParent {
       numOutputRows: GpuMetric,
       numInputBatches: GpuMetric,
       opTime: GpuMetric,
-      fetchTime: GpuMetric): Iterator[ColumnarBatch] => Iterator[InternalRow] = {
+      streamTime: GpuMetric): Iterator[ColumnarBatch] => Iterator[InternalRow] = {
     if (CudfRowTransitions.areAllSupported(output) &&
         // For a small number of columns it is still best to do it the original way
         output.length > 4 &&
-        // The cudf kernel only supports up to 1.5 KB per row which means at most 184 double/long
-        // values. Spark by default limits codegen to 100 fields "spark.sql.codegen.maxFields".
-        // So, we are going to be cautious and start with that until we have tested it more.
-        output.length < 100) {
+        // We can support upto 2^31 bytes per row. That is ~250M columns of 64-bit fixed-width data.
+        // This number includes the 1-bit validity per column, but doesn't include padding.
+        // We are being conservative by only allowing 100M columns until we feel the need to
+        // increase this number
+        output.length <= 100000000) {
       (batches: Iterator[ColumnarBatch]) => {
         // UnsafeProjection is not serializable so do it on the executor side
         val toUnsafe = UnsafeProjection.create(output, output)
-        new AcceleratedColumnarToRowIterator(output,
-          batches, numInputBatches, numOutputRows, opTime, fetchTime).map(toUnsafe)
+        new AcceleratedColumnarToRowIterator(output, batches, numInputBatches, numOutputRows,
+          opTime, streamTime).map(toUnsafe)
       }
     } else {
       (batches: Iterator[ColumnarBatch]) => {
         // UnsafeProjection is not serializable so do it on the executor side
         val toUnsafe = UnsafeProjection.create(output, output)
         new ColumnarToRowIterator(batches,
-          numInputBatches, numOutputRows, opTime, fetchTime).map(toUnsafe)
+          numInputBatches, numOutputRows, opTime, streamTime).map(toUnsafe)
       }
     }
   }

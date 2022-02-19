@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,13 +22,12 @@ import java.util.concurrent.{Callable, ConcurrentLinkedQueue, Future, LinkedBloc
 
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
-import scala.collection.immutable.HashSet
 import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, Queue}
 import scala.math.max
 
 import ai.rapids.cudf.{ColumnVector, HostMemoryBuffer, NvtxColor, NvtxRange, Table}
 import com.google.common.util.concurrent.ThreadFactoryBuilder
-import com.nvidia.spark.rapids.GpuMetric.{NUM_OUTPUT_BATCHES, PEAK_DEVICE_MEMORY}
+import com.nvidia.spark.rapids.GpuMetric.{NUM_OUTPUT_BATCHES, PEAK_DEVICE_MEMORY, SEMAPHORE_WAIT_TIME}
 import org.apache.commons.io.IOUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.{FileSystem, Path}
@@ -83,6 +82,9 @@ trait MultiFileReaderFunctions extends Arm {
     }
   }
 
+  @scala.annotation.nowarn(
+    "msg=method getAllStatistics in class FileSystem is deprecated"
+  )
   protected def fileSystemBytesRead(): Long = {
     FileSystem.getAllStatistics.asScala.map(_.getThreadStatistics.getBytesRead).sum
   }
@@ -128,9 +130,7 @@ abstract class MultiFilePartitionReaderFactoryBase(
 
   protected val maxReadBatchSizeRows = rapidsConf.maxReadBatchSizeRows
   protected val maxReadBatchSizeBytes = rapidsConf.maxReadBatchSizeBytes
-  private val configCloudSchemes = rapidsConf.getCloudSchemes
-  private val CLOUD_SCHEMES = HashSet("dbfs", "s3", "s3a", "s3n", "wasbs", "gs")
-  private val allCloudSchemes = CLOUD_SCHEMES ++ configCloudSchemes.getOrElse(Seq.empty)
+  private val allCloudSchemes = rapidsConf.getCloudSchemes.toSet
 
   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
     throw new IllegalStateException("GPU column parser called to read rows")
@@ -308,7 +308,6 @@ abstract class MultiFileCloudPartitionReaderBase(
   private var filesToRead = 0
   protected var currentFileHostBuffers: Option[HostMemoryBuffersWithMetaDataBase] = None
   private var isInitted = false
-  private var isFirstBatch = true
   private val tasks = new ConcurrentLinkedQueue[Future[HostMemoryBuffersWithMetaDataBase]]()
   private val tasksToRun = new Queue[Callable[HostMemoryBuffersWithMetaDataBase]]()
   private[this] val inputMetrics = Option(TaskContext.get).map(_.taskMetrics().inputMetrics)
@@ -317,16 +316,17 @@ abstract class MultiFileCloudPartitionReaderBase(
   private def initAndStartReaders(): Unit = {
     // limit the number we submit at once according to the config if set
     val limit = math.min(maxNumFileProcessed, files.length)
+    val tc = TaskContext.get
     for (i <- 0 until limit) {
       val file = files(i)
       // Add these in the order as we got them so that we can make sure
       // we process them in the same order as CPU would.
-      tasks.add(getThreadPool(numThreads).submit(getBatchRunner(file, conf, filters)))
+      tasks.add(getThreadPool(numThreads).submit(getBatchRunner(tc, file, conf, filters)))
     }
     // queue up any left to add once others finish
     for (i <- limit until files.length) {
       val file = files(i)
-      tasksToRun.enqueue(getBatchRunner(file, conf, filters))
+      tasksToRun.enqueue(getBatchRunner(tc, file, conf, filters))
     }
     isInitted = true
     filesToRead = files.length
@@ -336,15 +336,17 @@ abstract class MultiFileCloudPartitionReaderBase(
    * The sub-class must implement the real file reading logic in a Callable
    * which will be running in a thread pool
    *
+   * @param tc   task context to use
    * @param file file to be read
    * @param conf the Configuration parameters
    * @param filters push down filters
    * @return Callable[HostMemoryBuffersWithMetaDataBase]
    */
   def getBatchRunner(
-    file: PartitionedFile,
-    conf: Configuration,
-    filters: Array[Filter]): Callable[HostMemoryBuffersWithMetaDataBase]
+      tc: TaskContext,
+      file: PartitionedFile,
+      conf: Configuration,
+      filters: Array[Filter]): Callable[HostMemoryBuffersWithMetaDataBase]
 
   /**
    * Get ThreadPoolExecutor to run the Callable.
@@ -423,15 +425,12 @@ abstract class MultiFileCloudPartitionReaderBase(
       next()
     }
 
-    if (isFirstBatch) {
-      if (batch.isEmpty) {
-        // This is odd, but some operators return data even when there is no input so we need to
-        // be sure that we grab the GPU if there were no batches.
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
-      }
-      isFirstBatch = false
-    }
-
+    // NOTE: At this point, the task may not have yet acquired the semaphore if `batch` is `None`.
+    // We are not acquiring the semaphore here since this next() is getting called from
+    // the `PartitionReaderIterator` which implements a standard iterator pattern, and
+    // advertises `hasNext` as false when we return false here. No downstream tasks should
+    // try to call next after `hasNext` returns false, and any task that produces some kind of
+    // data when `hasNext` is false is responsible to get the semaphore themselves.
     batch.isDefined
   }
 
@@ -561,7 +560,6 @@ abstract class MultiFileCoalescingPartitionReaderBase(
   private val blockIterator: BufferedIterator[SingleDataBlockInfo] =
     clippedBlocks.iterator.buffered
   private[this] val inputMetrics = TaskContext.get.taskMetrics().inputMetrics
-  private[this] var isFirstBatch = true
 
   private case class CurrentChunkMeta(
     clippedSchema: SchemaBase,
@@ -629,6 +627,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    * The sub-class must implement the real file reading logic in a Callable
    * which will be running in a thread pool
    *
+   * @param tc     task context to use
    * @param file   file to be read
    * @param outhmb the sliced HostMemoryBuffer to hold the blocks, and the implementation
    *               is in charge of closing it in sub-class
@@ -640,10 +639,11 @@ abstract class MultiFileCoalescingPartitionReaderBase(
    *         result._2 is the bytes read
    */
   def getBatchRunner(
-    file: Path,
-    outhmb: HostMemoryBuffer,
-    blocks: ArrayBuffer[DataBlockBase],
-    offset: Long): Callable[(Seq[DataBlockBase], Long)]
+      tc: TaskContext,
+      file: Path,
+      outhmb: HostMemoryBuffer,
+      blocks: ArrayBuffer[DataBlockBase],
+      offset: Long): Callable[(Seq[DataBlockBase], Long)]
 
   /**
    * File format short name used for logging and other things to uniquely identity
@@ -704,15 +704,12 @@ abstract class MultiFileCoalescingPartitionReaderBase(
       }
     }
 
-    if (isFirstBatch) {
-      if (batch.isEmpty) {
-        // This is odd, but some operators return data even when there is no input so we need to
-        // be sure that we grab the GPU if there were no batches.
-        GpuSemaphore.acquireIfNecessary(TaskContext.get())
-      }
-      isFirstBatch = false
-    }
-
+    // NOTE: At this point, the task may not have yet acquired the semaphore if `batch` is `None`.
+    // We are not acquiring the semaphore here since this next() is getting called from
+    // the `PartitionReaderIterator` which implements a standard iterator pattern, and
+    // advertises `hasNext` as false when we return false here. No downstream tasks should
+    // try to call next after `hasNext` returns false, and any task that produces some kind of
+    // data when `hasNext` is false is responsible to get the semaphore themselves.
     batch.isDefined
   }
 
@@ -725,7 +722,7 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           None
         } else {
           // Someone is going to process this data, even if it is just a row count
-          GpuSemaphore.acquireIfNecessary(TaskContext.get())
+          GpuSemaphore.acquireIfNecessary(TaskContext.get(), metrics(SEMAPHORE_WAIT_TIME))
           val emptyBatch = new ColumnarBatch(Array.empty, currentChunkMeta.numTotalRows.toInt)
           addAllPartitionValues(Some(emptyBatch), currentChunkMeta.allPartValues,
             currentChunkMeta.rowsPerPartition, partitionSchema)
@@ -806,13 +803,14 @@ abstract class MultiFileCoalescingPartitionReaderBase(
           var offset = writeFileHeader(hmb)
 
           val allOutputBlocks = scala.collection.mutable.ArrayBuffer[DataBlockBase]()
+          val tc = TaskContext.get
           filesAndBlocks.foreach { case (file, blocks) =>
             val fileBlockSize = blocks.map(_.getBlockSize).sum
             // use a single buffer and slice it up for different files if we need
             val outLocal = hmb.slice(offset, fileBlockSize)
             // Third, copy the blocks for each file in parallel using background threads
             tasks.add(getThreadPool(numThreads).submit(
-              getBatchRunner(file, outLocal, blocks, offset)))
+              getBatchRunner(tc, file, outLocal, blocks, offset)))
             offset += fileBlockSize
           }
 

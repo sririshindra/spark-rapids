@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2021, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2022, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,23 +31,20 @@ import org.apache.spark.sql.catalyst.{InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, SessionCatalog}
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.catalyst.expressions.{Alias, Expression, ExprId, NullOrdering, SortDirection, SortOrder}
-import org.apache.spark.sql.catalyst.plans.JoinType
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Expression, ExprId, NullOrdering, SortDirection, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.{BroadcastMode, Partitioning}
 import org.apache.spark.sql.catalyst.trees.TreeNode
 import org.apache.spark.sql.catalyst.util.DateFormatter
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.adaptive.{BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, BroadcastQueryStageExec, ShuffleQueryStageExec}
 import org.apache.spark.sql.execution.command.RunnableCommand
 import org.apache.spark.sql.execution.datasources.{FileIndex, FilePartition, HadoopFsRelation, PartitionDirectory, PartitionedFile, PartitioningAwareFileIndex}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFilters
 import org.apache.spark.sql.execution.exchange.{ReusedExchangeExec, ShuffleExchangeExec}
-import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.internal.SQLConf.LegacyBehaviorPolicy
 import org.apache.spark.sql.rapids.GpuFileSourceScanExec
-import org.apache.spark.sql.rapids.execution.{GpuBroadcastNestedLoopJoinExecBase, GpuShuffleExchangeExecBase}
+import org.apache.spark.sql.rapids.execution.GpuShuffleExchangeExecBase
 import org.apache.spark.sql.sources.BaseRelation
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.{BlockId, BlockManagerId}
@@ -73,8 +70,12 @@ case class ClouderaShimVersion(major: Int, minor: Int, patch: Int, clouderaVersi
   override def toString(): String = s"$major.$minor.$patch.$clouderaVersion"
 }
 
-case class DatabricksShimVersion(major: Int, minor: Int, patch: Int) extends ShimVersion {
-  override def toString(): String = s"$major.$minor.$patch-databricks"
+case class DatabricksShimVersion(
+    major: Int,
+    minor: Int,
+    patch: Int,
+    dbver: String = "") extends ShimVersion {
+  override def toString(): String = s"$major.$minor.$patch-databricks$dbver"
 }
 
 case class EMRShimVersion(major: Int, minor: Int, patch: Int) extends ShimVersion {
@@ -95,6 +96,7 @@ trait SparkShims {
   def int96ParquetRebaseWrite(conf: SQLConf): String
   def int96ParquetRebaseReadKey: String
   def int96ParquetRebaseWriteKey: String
+  def isCastingStringToNegDecimalScaleSupported: Boolean = true
 
   def getParquetFilters(
     schema: MessageType,
@@ -104,14 +106,10 @@ trait SparkShims {
     pushDownStartWith: Boolean,
     pushDownInFilterThreshold: Int,
     caseSensitive: Boolean,
-    datetimeRebaseMode: LegacyBehaviorPolicy.Value): ParquetFilters
+    lookupFileMeta: String => String,
+    dateTimeRebaseModeFromConf: String): ParquetFilters
 
-  def isGpuBroadcastHashJoin(plan: SparkPlan): Boolean
-  def isGpuShuffledHashJoin(plan: SparkPlan): Boolean
   def isWindowFunctionExec(plan: SparkPlan): Boolean
-  def getRapidsShuffleManagerClass: String
-  def getBuildSide(join: HashJoin): GpuBuildSide
-  def getBuildSide(join: BroadcastNestedLoopJoinExec): GpuBuildSide
   def getExprs: Map[Class[_ <: Expression], ExprRule[_ <: Expression]]
   def getGpuColumnarToRowTransition(plan: SparkPlan,
      exportColumnRdd: Boolean): GpuColumnarToRowExecParent
@@ -127,14 +125,6 @@ trait SparkShims {
     udfName: Option[String] = None,
     nullable: Boolean = true,
     udfDeterministic: Boolean = true): Expression
-
-  def getGpuBroadcastNestedLoopJoinShim(
-    left: SparkPlan,
-    right: SparkPlan,
-    join: BroadcastNestedLoopJoinExec,
-    joinType: JoinType,
-    condition: Option[Expression],
-    targetSizeBytes: Long): GpuBroadcastNestedLoopJoinExecBase
 
   def getGpuShuffleExchangeExec(
       gpuOutputPartitioning: GpuPartitioning,
@@ -166,9 +156,11 @@ trait SparkShims {
       maxSplitBytes: Long,
       relation: HadoopFsRelation): Array[PartitionedFile]
   def getFileScanRDD(
-    sparkSession: SparkSession,
-    readFunction: (PartitionedFile) => Iterator[InternalRow],
-    filePartitions: Seq[FilePartition]): RDD[InternalRow]
+      sparkSession: SparkSession,
+      readFunction: (PartitionedFile) => Iterator[InternalRow],
+      filePartitions: Seq[FilePartition],
+      readDataSchema: StructType,
+      metadataColumns: Seq[AttributeReference] = Seq.empty): RDD[InternalRow]
 
   def getFileSourceMaxMetadataValueLength(sqlConf: SQLConf): Int
 
@@ -184,8 +176,6 @@ trait SparkShims {
       schema: StructType,
       colType: String,
       resolver: Resolver): Unit
-
-  def sortOrderChildren(s: SortOrder): Seq[Expression]
 
   def sortOrder(child: Expression, direction: SortDirection): SortOrder = {
     sortOrder(child, direction, direction.defaultNullOrdering)
@@ -251,7 +241,24 @@ trait SparkShims {
 
   def filesFromFileIndex(fileCatalog: PartitioningAwareFileIndex): Seq[FileStatus]
 
+  def isEmptyRelation(relation: Any): Boolean
+
   def broadcastModeTransform(mode: BroadcastMode, toArray: Array[InternalRow]): Any
+
+  /**
+   * This call can produce an `EmptyHashedRelation` or an empty array,
+   * allowing the AQE rule `EliminateJoinToEmptyRelation` in Spark 3.1.x
+   * to optimize certain joins.
+   *
+   * In Spark 3.2.0, the optimization is still performed (under `AQEPropagateEmptyRelation`),
+   * but the AQE optimizer is looking at the metrics for the query stage to determine
+   * if numRows == 0, and if so it can eliminate certain joins.
+   *
+   * The call is implemented only for Spark 3.1.x+. It is disabled in
+   * Databricks because it requires a task context to perform the
+   * `BroadcastMode.transform` call, but we'd like to call this from the driver.
+   */
+  def tryTransformIfEmptyRelation(mode: BroadcastMode): Option[Any]
 
   def isAqePlan(p: SparkPlan): Boolean
 
@@ -281,14 +288,28 @@ trait SparkShims {
 
   def registerKryoClasses(kryo: Kryo): Unit
 
-  def getCentralMomentDivideByZeroEvalResult(): Expression
-}
+  def getAdaptiveInputPlan(adaptivePlan: AdaptiveSparkPlanExec): SparkPlan
 
-abstract class SparkCommonShims extends SparkShims {
-  override def alias(child: Expression, name: String)(
-      exprId: ExprId,
-      qualifier: Seq[String],
-      explicitMetadata: Option[Metadata]): Alias = {
-    Alias(child, name)(exprId, qualifier, explicitMetadata)
-  }
+  /**
+  * This Boolean variable set to `true` for Spark < 3.1.0, and set to
+  * `SQLConf.get.legacyStatisticalAggregate` otherwise.
+  * This is because the `legacyStatisticalAggregate` config was introduced in Spark 3.1.0.
+  */
+  def getLegacyStatisticalAggregate(): Boolean
+
+
+  def dateFormatInRead(fileOptions: Serializable): Option[String]
+
+  def timestampFormatInRead(fileOptions: Serializable): Option[String]
+
+  def neverReplaceShowCurrentNamespaceCommand: ExecRule[_ <: SparkPlan]
+
+  /**
+   * Determine if the Spark version allows the supportsColumnar flag to be overridden
+   * in AdaptiveSparkPlanExec. This feature was introduced in Spark 3.2 as part of
+   * SPARK-35881.
+   */
+  def supportsColumnarAdaptivePlans: Boolean
+
+  def columnarAdaptivePlan(a: AdaptiveSparkPlanExec, goal: CoalesceSizeGoal): SparkPlan
 }
