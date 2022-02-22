@@ -86,6 +86,10 @@
             <modules><module>spark321</module></modules>
         </profile>
         <profile>
+            <id>release321cdh</id>
+            <modules><module>spark321cdh</module></modules>
+        </profile>
+        <profile>
             <id>release322</id>
             <modules><module>spark322</module></modules>
         </profile>
